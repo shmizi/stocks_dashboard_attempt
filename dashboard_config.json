@@ -1,0 +1,44 @@
+{
+  "etf_data": {
+    "GOLDBEES": {
+      "name": "Nippon India ETF Gold Bees",
+      "description": "This is an Exchange-Traded Fund that tracks the price of gold.",
+      "category": "Gold ETF"
+    },
+    "NIFTYBEES": {
+      "name": "Nippon India ETF Nifty BeES",
+      "description": "ETF tracking the Nifty 50 index",
+      "category": "Equity ETF"
+    },
+    "BANKBEES": {
+      "name": "Nippon India ETF Bank BeES",
+      "description": "ETF tracking the Nifty Bank index",
+      "category": "Sector ETF"
+    }
+  },
+  "rate_limits": {
+    "yfinance_delay": 0.5,
+    "screener_delay": 1.0,
+    "chartink_delay": 2.0,
+    "max_retries": 3,
+    "timeout": 10
+  },
+  "data_sources": {
+    "portfolio_file": "holdings-SOH330.xlsx",
+    "portfolio_start_row": 22,
+    "portfolio_columns": "B:M"
+  },
+  "technical_indicators": {
+    "supertrend_length": 10,
+    "supertrend_multiplier": 7.0
+  },
+  "news": {
+    "max_articles": 20,
+    "cache_ttl": 1800
+  },
+  "screener": {
+    "min_market_cap": 500,
+    "weekly_gain_threshold": 1.1,
+    "max_results": 50
+  }
+}
