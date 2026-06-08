@@ -1,13 +1,15 @@
 # data_sources.py
 import pandas as pd
+import numpy as np
 import yfinance as yf
-import pandas_ta as ta
+
 import requests
 from bs4 import BeautifulSoup
 import re
 from urllib.parse import quote
 import json
-import feedparser
+import xml.etree.ElementTree as ET
+import nltk
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 import streamlit as st
 from typing import Dict, List, Tuple, Optional, Any
@@ -15,6 +17,111 @@ from typing import Dict, List, Tuple, Optional, Any
 from config import Config
 from rate_limiter import rate_limited_call
 from error_handler import ErrorBoundary, DataValidator, ValidationError
+
+
+def calculate_supertrend(df: pd.DataFrame, length: int = 10, multiplier: float = 7.0):
+    """
+    Pure numpy/pandas Supertrend calculation — no pandas_ta required.
+    Returns (supertrend_value, direction) or (None, None) on failure.
+    """
+    try:
+        high = df['High'].astype(float)
+        low  = df['Low'].astype(float)
+        close = df['Close'].astype(float)
+
+        # Average True Range (ATR)
+        tr = pd.concat([
+            high - low,
+            (high - close.shift(1)).abs(),
+            (low  - close.shift(1)).abs()
+        ], axis=1).max(axis=1)
+
+        atr = tr.ewm(span=length, adjust=False).mean()
+
+        hl2 = (high + low) / 2
+        upper_band = hl2 + multiplier * atr
+        lower_band = hl2 - multiplier * atr
+
+        supertrend = pd.Series(index=df.index, dtype=float)
+        direction  = pd.Series(index=df.index, dtype=int)   # 1 = uptrend, -1 = downtrend
+
+        for i in range(1, len(df)):
+            # Lower band: only moves up
+            if lower_band.iloc[i] > lower_band.iloc[i - 1] or close.iloc[i - 1] < supertrend.iloc[i - 1]:
+                lb = lower_band.iloc[i]
+            else:
+                lb = lower_band.iloc[i - 1]
+
+            # Upper band: only moves down
+            if upper_band.iloc[i] < upper_band.iloc[i - 1] or close.iloc[i - 1] > supertrend.iloc[i - 1]:
+                ub = upper_band.iloc[i]
+            else:
+                ub = upper_band.iloc[i - 1]
+
+            lower_band.iloc[i] = lb
+            upper_band.iloc[i] = ub
+
+            prev_st = supertrend.iloc[i - 1] if i > 1 else ub
+
+            if pd.isna(prev_st) or prev_st == ub:
+                if close.iloc[i] <= ub:
+                    supertrend.iloc[i] = ub
+                    direction.iloc[i]  = -1
+                else:
+                    supertrend.iloc[i] = lb
+                    direction.iloc[i]  = 1
+            else:
+                if close.iloc[i] >= lb:
+                    supertrend.iloc[i] = lb
+                    direction.iloc[i]  = 1
+                else:
+                    supertrend.iloc[i] = ub
+                    direction.iloc[i]  = -1
+
+        last_st = supertrend.iloc[-1]
+        if pd.isna(last_st):
+            return None, None
+        return float(last_st), int(direction.iloc[-1])
+
+    except Exception:
+        return None, None
+
+
+def parse_rss_feed(url: str, timeout: int = 10) -> List[Dict]:
+    """
+    Fetch and parse an RSS/Atom feed using only requests + stdlib xml.
+    Returns a list of dicts with keys: title, link, published, source.
+    """
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (compatible; StockDashboard/1.0)'
+    }
+    response = requests.get(url, headers=headers, timeout=timeout)
+    response.raise_for_status()
+
+    root = ET.fromstring(response.content)
+    ns = {'atom': 'http://www.w3.org/2005/Atom'}
+
+    entries = []
+
+    # RSS 2.0
+    for item in root.findall('.//item'):
+        title = item.findtext('title') or ''
+        link  = item.findtext('link') or ''
+        pub   = item.findtext('pubDate') or ''
+        source_el = item.find('source')
+        source = source_el.text if source_el is not None else 'N/A'
+        entries.append({'title': title, 'link': link, 'published': pub, 'source': source})
+
+    # Atom
+    if not entries:
+        for entry in root.findall('atom:entry', ns):
+            title = entry.findtext('atom:title', namespaces=ns) or ''
+            link_el = entry.find("atom:link[@rel='alternate']", ns) or entry.find('atom:link', ns)
+            link  = link_el.get('href', '') if link_el is not None else ''
+            pub   = entry.findtext('atom:published', namespaces=ns) or ''
+            entries.append({'title': title, 'link': link, 'published': pub, 'source': 'N/A'})
+
+    return entries
 
 
 class YFinanceProvider:
@@ -35,7 +142,6 @@ class YFinanceProvider:
         """Fetch stock analysis data with rate limiting"""
 
         def fetch_data():
-            # Validate symbol
             symbol_clean = DataValidator.validate_stock_symbol(symbol)
 
             # Fetch recent data for price and day change
@@ -45,12 +151,11 @@ class YFinanceProvider:
             if stock_data.empty or len(stock_data) < 2:
                 raise ValidationError("Insufficient price data")
 
-            # Clean multi-level columns
             if isinstance(stock_data.columns, pd.MultiIndex):
                 stock_data.columns = stock_data.columns.droplevel(1)
 
             current_price = float(stock_data.iloc[-1]['Close'])
-            day_change = float(current_price - stock_data.iloc[-2]['Close'])
+            day_change    = float(current_price - stock_data.iloc[-2]['Close'])
 
             # Fetch longer-term data for Supertrend
             supertrend_data = yf.download(f"{symbol_clean}.NS", period="1y",
@@ -62,18 +167,15 @@ class YFinanceProvider:
                 if isinstance(supertrend_data.columns, pd.MultiIndex):
                     supertrend_data.columns = supertrend_data.columns.droplevel(1)
 
-                # Calculate Supertrend
-                st_length = self.config.get('technical_indicators.supertrend_length', 10)
+                st_length     = self.config.get('technical_indicators.supertrend_length', 10)
                 st_multiplier = self.config.get('technical_indicators.supertrend_multiplier', 7.0)
 
-                supertrend_data.ta.supertrend(length=st_length, multiplier=st_multiplier, append=True)
-                st_col_name = f'SUPERT_{st_length}_{st_multiplier}'
+                supertrend_value, direction = calculate_supertrend(
+                    supertrend_data, length=st_length, multiplier=st_multiplier
+                )
 
-                if st_col_name in supertrend_data.columns:
-                    latest_st = supertrend_data.iloc[-1][st_col_name]
-                    if not pd.isna(latest_st):
-                        supertrend_value = float(latest_st)
-                        status = "Above Supertrend" if current_price > supertrend_value else "Below Supertrend"
+                if supertrend_value is not None:
+                    status = "Above Supertrend" if current_price > supertrend_value else "Below Supertrend"
 
             return current_price, day_change, supertrend_value, status, None
 
@@ -81,7 +183,7 @@ class YFinanceProvider:
             service="yfinance",
             func=fetch_data,
             min_delay=self.rate_limit_delay,
-            calls_per_minute=30,  # Conservative limit
+            calls_per_minute=30,
             max_retries=self.max_retries
         )
 
@@ -124,41 +226,34 @@ class ScreenerProvider:
 
                         soup = BeautifulSoup(response.text, 'html.parser')
 
-                        # Extract company name
                         if company_name == symbol_clean:
                             name_element = soup.select_one("h1.show-from-tablet-landscape")
                             if name_element:
                                 company_name = name_element.get_text(strip=True)
 
-                        # Extract about section
                         if about == "N/A":
                             about_section = soup.select_one("div.about p")
                             if about_section:
                                 about = about_section.get_text(strip=True).replace('...read more', '').strip()
 
-                        # Extract financial ratios
                         if roe == "N/A" or roce == "N/A":
                             ratio_elements = soup.select("#top-ratios li")
                             for li in ratio_elements:
-                                name_span = li.select_one(".name")
+                                name_span   = li.select_one(".name")
                                 number_span = li.select_one(".number")
-
                                 if name_span and number_span:
-                                    ratio_name = name_span.get_text(strip=True)
+                                    ratio_name  = name_span.get_text(strip=True)
                                     ratio_value = number_span.get_text(strip=True)
-
                                     if "ROE" in ratio_name and roe == "N/A":
                                         roe = ratio_value
                                     elif "ROCE" in ratio_name and roce == "N/A":
                                         roce = ratio_value
 
-                        # Extract industry
                         if industry == "N/A":
                             industry_tag = soup.select_one(".company-info .flex-row a[href*='/industry/']")
                             if industry_tag:
                                 industry = industry_tag.get_text(strip=True)
 
-                        # Break if we have all the data
                         if all(val != "N/A" for val in [roe, roce, industry, about]):
                             break
 
@@ -171,7 +266,7 @@ class ScreenerProvider:
             service="screener",
             func=fetch_metrics,
             min_delay=self.rate_limit_delay,
-            calls_per_minute=20,  # More conservative for scraping
+            calls_per_minute=20,
             max_retries=self.max_retries
         )
 
@@ -194,7 +289,7 @@ class ScreenerProvider:
             price_element = soup.select_one(".company-info div.flex > h2")
 
             if price_element:
-                price_text = price_element.get_text(strip=True)
+                price_text  = price_element.get_text(strip=True)
                 price_match = re.search(r'[\d,.]+', price_text)
                 if price_match:
                     return float(price_match.group().replace(",", ""))
@@ -235,7 +330,6 @@ class ChartinkProvider:
             with requests.Session() as session:
                 session.headers.update(headers)
 
-                # Get CSRF token
                 screener_url = "https://chartink.com/screener/dashboard"
                 response = session.get(screener_url, timeout=self.timeout)
                 response.raise_for_status()
@@ -249,10 +343,8 @@ class ChartinkProvider:
                 csrf_token = csrf_token['content']
                 session.headers.update({'X-CSRF-TOKEN': csrf_token})
 
-                # Execute scan
-                payload = {'scan_clause': scan_clause, '_token': csrf_token}
-                process_url = "https://chartink.com/screener/process"
-
+                payload      = {'scan_clause': scan_clause, '_token': csrf_token}
+                process_url  = "https://chartink.com/screener/process"
                 post_response = session.post(process_url, data=payload, timeout=self.timeout)
                 post_response.raise_for_status()
 
@@ -263,7 +355,7 @@ class ChartinkProvider:
             service="chartink",
             func=execute_scan,
             min_delay=self.rate_limit_delay,
-            calls_per_minute=10,  # Very conservative for complex scans
+            calls_per_minute=10,
             max_retries=self.max_retries
         )
 
@@ -281,45 +373,43 @@ class NewsProvider:
         error_message="Failed to fetch news data"
     )
     def get_news_from_rss(self, portfolio_stocks: List[Dict]) -> List[Dict]:
-        """Fetch and analyze news with portfolio relevance"""
+        """Fetch and analyse news with portfolio relevance — no feedparser needed."""
 
         query = '"Indian stock market" OR "NSE" OR "BSE" OR "Sensex"'
-        url = f"https://news.google.com/rss/search?q={quote(query)}&hl=en-IN&gl=IN&ceid=IN:en"
+        url   = f"https://news.google.com/rss/search?q={quote(query)}&hl=en-IN&gl=IN&ceid=IN:en"
 
-        feed = feedparser.parse(url)
-        if not feed.entries:
+        raw_entries = parse_rss_feed(url, timeout=10)
+        if not raw_entries:
             raise ValidationError("No news articles found")
 
-        articles = []
-        stock_names = [s.get('company_name', s['symbol']) for s in portfolio_stocks]
+        stock_names   = [s.get('company_name', s['symbol']) for s in portfolio_stocks]
         stock_symbols = [s['symbol'].split('-')[0] for s in portfolio_stocks]
 
-        for entry in feed.entries[:self.max_articles]:
-            sentiment = self._get_sentiment(entry.title)
+        articles = []
+        for entry in raw_entries[:self.max_articles]:
+            title     = entry.get('title', '')
+            sentiment = self._get_sentiment(title)
             affected_stocks = []
 
-            # Check which portfolio stocks are mentioned
+            title_lower = title.lower()
             for i, name in enumerate(stock_names):
-                symbol = stock_symbols[i]
-                title_lower = entry.title.lower()
-
-                if (name.lower() in title_lower or
-                        symbol.lower() in title_lower):
-                    affected_stocks.append(stock_symbols[i])
+                sym = stock_symbols[i]
+                if name.lower() in title_lower or sym.lower() in title_lower:
+                    affected_stocks.append(sym)
 
             articles.append({
-                "headline": entry.title,
-                "link": entry.link,
-                "source": getattr(entry, 'source', {}).get('title', 'N/A'),
-                "published": getattr(entry, 'published', 'N/A'),
+                "headline": title,
+                "link":      entry.get('link', '#'),
+                "source":    entry.get('source', 'N/A'),
+                "published": entry.get('published', 'N/A'),
                 "sentiment": sentiment,
-                "affected": list(set(affected_stocks))
+                "affected":  list(set(affected_stocks))
             })
 
         return articles
 
     def _get_sentiment(self, text: str) -> str:
-        """Analyze text sentiment"""
+        """Analyse text sentiment"""
         try:
             score = self.analyzer.polarity_scores(text)['compound']
             if score >= 0.05:
@@ -328,7 +418,7 @@ class NewsProvider:
                 return "Negative"
             else:
                 return "Neutral"
-        except:
+        except Exception:
             return "Neutral"
 
 
@@ -351,8 +441,10 @@ class AIProvider:
 
         def make_ai_request():
             prompt = self._create_industry_prompt(stocks_data)
-
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={api_key}"
+            url    = (
+                "https://generativelanguage.googleapis.com/v1beta/models/"
+                f"gemini-1.5-flash-latest:generateContent?key={api_key}"
+            )
             payload = {"contents": [{"parts": [{"text": prompt}]}]}
 
             response = requests.post(
@@ -367,7 +459,7 @@ class AIProvider:
             if 'candidates' not in result or not result['candidates']:
                 raise ValidationError("Invalid AI response structure")
 
-            content = result['candidates'][0]['content']['parts'][0]['text']
+            content    = result['candidates'][0]['content']['parts'][0]['text']
             json_match = re.search(r'\{.*\}', content, re.DOTALL)
 
             if not json_match:
@@ -384,7 +476,6 @@ class AIProvider:
         )
 
     def _create_industry_prompt(self, stocks_data: Dict[str, str]) -> str:
-        """Create prompt for industry classification"""
         return f"""Analyze the following company descriptions. For each company, provide its primary industry.
 Respond with ONLY a valid JSON object where the keys are the company symbols and the values are the identified industry.
 
@@ -396,39 +487,36 @@ Companies to analyze:
 
 
 class DataSourceManager:
-    """Centralized data source management"""
+    """Centralised data source management"""
 
     def __init__(self, config: Config):
-        self.config = config
+        self.config   = config
         self.yfinance = YFinanceProvider(config)
         self.screener = ScreenerProvider(config)
         self.chartink = ChartinkProvider(config)
-        self.news = NewsProvider(config)
-        self.ai = AIProvider(config)
+        self.news     = NewsProvider(config)
+        self.ai       = AIProvider(config)
 
     def get_stock_data(self, symbol: str) -> Dict[str, Any]:
         """Get comprehensive stock data from multiple sources"""
-        # Try YFinance first
         current_price, day_change, supertrend, status, error = self.yfinance.get_stock_analysis(symbol)
 
-        # If YFinance fails for price, try Screener fallback
         if current_price is None:
             current_price = self.screener.get_fallback_price(symbol)
             error = f"{error} (Price from Screener)" if error else "Price from Screener"
 
-        # Get company fundamentals from Screener
         company_name, roe, roce, industry, about = self.screener.get_company_metrics(symbol)
 
         return {
-            'symbol': symbol,
+            'symbol':        symbol,
             'current_price': current_price,
-            'day_change': day_change,
-            'supertrend': supertrend,
-            'status': status,
-            'company_name': company_name,
-            'roe': roe,
-            'roce': roce,
-            'industry': industry,
-            'about': about,
-            'tech_error': error
+            'day_change':    day_change,
+            'supertrend':    supertrend,
+            'status':        status,
+            'company_name':  company_name,
+            'roe':           roe,
+            'roce':          roce,
+            'industry':      industry,
+            'about':         about,
+            'tech_error':    error
         }

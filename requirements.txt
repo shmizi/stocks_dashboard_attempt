@@ -10,7 +10,6 @@ openpyxl>=3.1.2
 
 # Financial data
 yfinance>=0.2.20
-pandas-ta>=0.3.14b0
 
 # Web scraping and requests
 requests>=2.31.0
@@ -18,8 +17,6 @@ beautifulsoup4>=4.12.2
 urllib3>=2.0.4
 
 # News and sentiment
-feedparser>=6.0.10
-nltk>=3.8.1
 
 # Plotting and visualization (optional, for future enhancements)
 plotly>=5.15.0
@@ -27,3 +24,4 @@ matplotlib>=3.7.2
 
 # HTTP sessions and parsing
 lxml>=4.9.3
+nltk>=3.8.1
