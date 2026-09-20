@@ -25,19 +25,22 @@ A modular Streamlit app for real-time Indian stock portfolio analysis, news sent
 ### 1. Install dependencies
 
 ```bash
-pip install streamlit pandas yfinance pandas-ta requests beautifulsoup4 feedparser nltk
+pip install -r requirements.txt
 ```
 
-### 2. Download NLTK sentiment data (one-time)
+The VADER sentiment lexicon is downloaded automatically the first time you fetch news.
 
-```python
-import nltk
-nltk.download('vader_lexicon')
+### 2. (Optional) Add your Gemini API key
+
+```bash
+cp .streamlit/secrets.toml.example .streamlit/secrets.toml
 ```
 
-### 3. Place your portfolio Excel file
+Then put your key in `GEMINI_API_KEY`. The file is git-ignored. Without it you can still paste the key in the sidebar each session.
 
-Put your holdings file (e.g., `holdings-SOH330.xlsx`) in the project root, or update the path in Settings.
+### 3. Add your portfolio Excel file
+
+Either upload it from the sidebar (📤 Upload holdings — it's saved locally as `uploaded_holdings.xlsx` and reused next time), or put the file in the project root and set the path in Settings.
 
 **Expected Excel structure:**
 - Headers starting at row 23 (row index 22, configurable)
@@ -56,8 +59,9 @@ streamlit run main.py
 ## ✨ Features
 
 ### 📊 Portfolio Analysis
-- Loads holdings from your broker's Excel export
-- Fetches live prices via Yahoo Finance (with Screener.in as fallback)
+- Loads holdings from your broker's Excel export (upload or path)
+- Fetches all prices in a single Yahoo Finance request, then scrapes Screener.in fundamentals in parallel (Screener.in is also the price fallback)
+- Remembers the last refresh on disk (`.portfolio_cache.json`) so the app opens with data
 - Calculates P/L, day change, and portfolio-level totals
 - Supertrend (10, 7) signal for each holding — bullish/bearish status
 - ETF-aware: ETFs skip the Screener.in fundamentals scrape
@@ -148,7 +152,8 @@ All calls use exponential backoff on failure. Tune delays in Settings if you hit
 
 ## 📝 Notes
 
-- Data is fetched live on demand; nothing is persisted between sessions except `dashboard_config.json`.
-- The Gemini API key is session-only (not saved to config for security).
+- Data is fetched on demand and cached in-process: prices 15 min, fundamentals 24 h, scans/news 15–30 min. Use Settings → Clear Data Cache to force a refresh.
+- The Gemini API key is read from `.streamlit/secrets.toml` if present, otherwise it is session-only.
+- `*.xlsx` files are git-ignored so your broker export never gets committed.
 - Screener.in scraping respects a 1s delay; heavy portfolio loads may take 1–2 minutes.
 - This app is for personal/educational use. Respect each data provider's terms of service.

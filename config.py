@@ -1,4 +1,5 @@
 # config.py
+import copy
 import json
 import os
 from typing import Dict, List, Any
@@ -7,6 +8,10 @@ import streamlit as st
 
 class Config:
     """Configuration management for the stock dashboard"""
+
+    # Sections that hold user-managed collections. These are taken from the user's
+    # file as-is (never merged with defaults), so deleting an entry actually sticks.
+    COLLECTION_SECTIONS = {"etf_data", "screener_presets"}
 
     DEFAULT_CONFIG = {
         "etf_data": {
@@ -31,7 +36,8 @@ class Config:
             "screener_delay": 1.0,
             "chartink_delay": 2.0,
             "max_retries": 3,
-            "timeout": 10
+            "timeout": 10,
+            "parallel_workers": 4
         },
         "data_sources": {
             "portfolio_file": "holdings-SOH330.xlsx",
@@ -51,21 +57,15 @@ class Config:
             "weekly_gain_threshold": 1.1,
             "max_results": 50
         },
-        "screener_presets": {
-            "weekly_breakout": {
-                "name": "Weekly Breakout",
-                "description": "Stocks up 10%+ from 1 week ago, above Supertrend, good market cap",
-                "logic": "AND",
-                "criteria": [
-                    {"id": "wb1", "name": "Weekly Gain 10%+", "left_operand": "daily close", "operator": ">=",
-                     "right_operand": "1 week ago close * 1.1", "enabled": True},
-                    {"id": "wb2", "name": "Above Supertrend", "left_operand": "daily close", "operator": ">",
-                     "right_operand": "daily supertrend( 10, 7 )", "enabled": True},
-                    {"id": "wb3", "name": "Market Cap > 500Cr", "left_operand": "market cap", "operator": ">",
-                     "right_operand": "500", "enabled": True}
-                ]
-            }
-        }
+        "benchmark": {
+            "symbol": "NIFTYBEES"
+        },
+        "portfolio": {
+            "concentration_threshold": 15
+        },
+        "watchlist": []
+        # NOTE: screener_presets are intentionally not defaulted here. ScreenerBuilder
+        # seeds its own defaults when the section is empty, and offers a "restore" action.
     }
 
     def __init__(self, config_file: str = "dashboard_config.json"):
@@ -76,32 +76,42 @@ class Config:
         """Load configuration from file or create default"""
         if os.path.exists(self.config_file):
             try:
-                with open(self.config_file, 'r') as f:
+                with open(self.config_file, 'r', encoding='utf-8') as f:
                     config = json.load(f)
-                # Merge with defaults to ensure all keys exist
+                # Backfill missing settings so every expected key exists
                 return self._merge_config(self.DEFAULT_CONFIG, config)
             except Exception as e:
                 st.warning(f"Could not load config file: {e}. Using defaults.")
 
         # Create default config file
-        self._save_config(self.DEFAULT_CONFIG)
-        return self.DEFAULT_CONFIG.copy()
+        defaults = copy.deepcopy(self.DEFAULT_CONFIG)
+        self._save_config(defaults)
+        return defaults
 
     def _merge_config(self, default: Dict, user: Dict) -> Dict:
-        """Recursively merge user config with defaults"""
-        result = default.copy()
+        """
+        Backfill missing keys from defaults into the user config.
+
+        Settings sections (rate_limits, news, ...) are merged key-by-key so new
+        settings appear automatically. Collection sections (etf_data,
+        screener_presets) are taken verbatim from the user file — otherwise a
+        default entry the user deleted would be resurrected on every load.
+        """
+        result = copy.deepcopy(default)
         for key, value in user.items():
-            if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            if key in self.COLLECTION_SECTIONS:
+                result[key] = copy.deepcopy(value)
+            elif key in result and isinstance(result[key], dict) and isinstance(value, dict):
                 result[key] = self._merge_config(result[key], value)
             else:
-                result[key] = value
+                result[key] = copy.deepcopy(value)
         return result
 
     def _save_config(self, config: Dict[str, Any]):
         """Save configuration to file"""
         try:
-            with open(self.config_file, 'w') as f:
-                json.dump(config, f, indent=2)
+            with open(self.config_file, 'w', encoding='utf-8') as f:
+                json.dump(config, f, indent=2, ensure_ascii=False)
         except Exception as e:
             st.error(f"Could not save config file: {e}")
 

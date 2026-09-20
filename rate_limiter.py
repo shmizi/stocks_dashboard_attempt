@@ -1,9 +1,26 @@
 # rate_limiter.py
+import logging
 import time
 import threading
 from collections import defaultdict, deque
 from typing import Dict, Optional
+import requests
 import streamlit as st
+
+logger = logging.getLogger(__name__)
+
+# Only transient network failures are worth retrying. Data problems (bad symbol,
+# missing element, malformed response) will fail identically every time.
+RETRYABLE_EXCEPTIONS = (requests.RequestException, ConnectionError, TimeoutError)
+
+
+def _on_script_thread() -> bool:
+    """True when Streamlit UI calls are safe (i.e. not inside a worker thread)."""
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        return get_script_run_ctx(suppress_warning=True) is not None
+    except Exception:
+        return False
 
 
 class RateLimiter:
@@ -73,13 +90,16 @@ class RetryHandler:
         for attempt in range(max_retries + 1):
             try:
                 return func()
-            except Exception as e:
+            except RETRYABLE_EXCEPTIONS as e:
                 if attempt == max_retries:
-                    st.error(f"{service_name} failed after {max_retries} retries: {str(e)}")
-                    raise e
+                    # Caller's ErrorBoundary reports to the user; just log here
+                    logger.error(f"{service_name} failed after {max_retries} retries: {e}")
+                    raise
 
                 delay = base_delay * (2 ** attempt)
-                st.warning(f"{service_name} attempt {attempt + 1} failed. Retrying in {delay}s...")
+                logger.warning(f"{service_name} attempt {attempt + 1} failed ({e}). Retrying in {delay}s")
+                if _on_script_thread():
+                    st.toast(f"{service_name}: network error, retrying in {delay:.0f}s…", icon="🔁")
                 time.sleep(delay)
 
 

@@ -8,9 +8,10 @@ from bs4 import BeautifulSoup
 import re
 from urllib.parse import quote
 import json
+import logging
 import xml.etree.ElementTree as ET
-import nltk
-from nltk.sentiment.vader import SentimentIntensityAnalyzer
+from datetime import datetime
+from email.utils import parsedate_to_datetime
 import streamlit as st
 from typing import Dict, List, Tuple, Optional, Any
 
@@ -18,73 +19,158 @@ from config import Config
 from rate_limiter import rate_limited_call
 from error_handler import ErrorBoundary, DataValidator, ValidationError
 
+logger = logging.getLogger(__name__)
 
-def calculate_supertrend(df: pd.DataFrame, length: int = 10, multiplier: float = 7.0):
+# Cache TTLs (seconds). Prices go stale quickly; fundamentals barely move.
+PRICE_TTL        = 15 * 60
+FUNDAMENTALS_TTL = 24 * 60 * 60
+SCAN_TTL         = 15 * 60
+
+BROWSER_UA = ('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 '
+              '(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36')
+
+
+def calculate_supertrend_series(df: pd.DataFrame, length: int = 10,
+                                multiplier: float = 7.0) -> Optional[pd.DataFrame]:
     """
-    Pure numpy/pandas Supertrend calculation — no pandas_ta required.
-    Returns (supertrend_value, direction) or (None, None) on failure.
+    Full Supertrend series — pure numpy/pandas, matches TradingView Pine Script.
+    Returns a DataFrame indexed like `df` with columns ['supertrend', 'direction'],
+    or None if there isn't enough data.
+
+    direction == 1  → uptrend   (supertrend line is BELOW price, acting as support)
+    direction == -1 → downtrend (supertrend line is ABOVE price, acting as resistance)
+
+    Pine Script reference:
+        lower := lower > prevLower or close[1] < prevLower ? lower : prevLower
+        upper := upper < prevUpper or close[1] > prevUpper ? upper : prevUpper
+        direction := close > prevUpper ? 1 : close < prevLower ? -1 : nz(direction[1], 1)
+        superTrend := direction == 1 ? lower : upper
     """
     try:
-        high = df['High'].astype(float)
-        low  = df['Low'].astype(float)
+        high  = df['High'].astype(float)
+        low   = df['Low'].astype(float)
         close = df['Close'].astype(float)
 
-        # Average True Range (ATR)
+        if len(df) < length + 1:
+            return None
+
+        # --- ATR via Wilder's RMA (alpha = 1/length) — matches TradingView ---
         tr = pd.concat([
             high - low,
             (high - close.shift(1)).abs(),
             (low  - close.shift(1)).abs()
         ], axis=1).max(axis=1)
 
-        atr = tr.ewm(span=length, adjust=False).mean()
+        atr = tr.ewm(alpha=1.0 / length, adjust=False).mean()
 
-        hl2 = (high + low) / 2
-        upper_band = hl2 + multiplier * atr
-        lower_band = hl2 - multiplier * atr
+        # --- Basic bands ---
+        hl2         = (high + low) / 2.0
+        basic_upper = hl2 + multiplier * atr
+        basic_lower = hl2 - multiplier * atr
 
-        supertrend = pd.Series(index=df.index, dtype=float)
-        direction  = pd.Series(index=df.index, dtype=int)   # 1 = uptrend, -1 = downtrend
+        # Working arrays (numpy for speed)
+        n           = len(df)
+        upper_band  = basic_upper.to_numpy(dtype=float).copy()   # .copy() required for in-loop writes
+        lower_band  = basic_lower.to_numpy(dtype=float).copy()
+        close_arr   = close.to_numpy(dtype=float)
+        supertrend  = np.full(n, np.nan)
+        direction   = np.ones(n, dtype=int)   # 1=uptrend, -1=downtrend
 
-        for i in range(1, len(df)):
-            # Lower band: only moves up
-            if lower_band.iloc[i] > lower_band.iloc[i - 1] or close.iloc[i - 1] < supertrend.iloc[i - 1]:
-                lb = lower_band.iloc[i]
+        for i in range(1, n):
+            prev_lower = lower_band[i - 1]
+            prev_upper = upper_band[i - 1]
+            prev_close = close_arr[i - 1]
+
+            # Lower band only ratchets UP (Pine: lower > prevLower or close[1] < prevLower)
+            if basic_lower.iloc[i] > prev_lower or prev_close < prev_lower:
+                lower_band[i] = basic_lower.iloc[i]
             else:
-                lb = lower_band.iloc[i - 1]
+                lower_band[i] = prev_lower
 
-            # Upper band: only moves down
-            if upper_band.iloc[i] < upper_band.iloc[i - 1] or close.iloc[i - 1] > supertrend.iloc[i - 1]:
-                ub = upper_band.iloc[i]
+            # Upper band only ratchets DOWN (Pine: upper < prevUpper or close[1] > prevUpper)
+            if basic_upper.iloc[i] < prev_upper or prev_close > prev_upper:
+                upper_band[i] = basic_upper.iloc[i]
             else:
-                ub = upper_band.iloc[i - 1]
+                upper_band[i] = prev_upper
 
-            lower_band.iloc[i] = lb
-            upper_band.iloc[i] = ub
-
-            prev_st = supertrend.iloc[i - 1] if i > 1 else ub
-
-            if pd.isna(prev_st) or prev_st == ub:
-                if close.iloc[i] <= ub:
-                    supertrend.iloc[i] = ub
-                    direction.iloc[i]  = -1
-                else:
-                    supertrend.iloc[i] = lb
-                    direction.iloc[i]  = 1
+            # Direction: compare CURRENT close against PREVIOUS bar's bands
+            # (Pine: close > prevUpper → 1, close < prevLower → -1, else keep)
+            cur_close = close_arr[i]
+            if cur_close > prev_upper:
+                direction[i] = 1
+            elif cur_close < prev_lower:
+                direction[i] = -1
             else:
-                if close.iloc[i] >= lb:
-                    supertrend.iloc[i] = lb
-                    direction.iloc[i]  = 1
-                else:
-                    supertrend.iloc[i] = ub
-                    direction.iloc[i]  = -1
+                direction[i] = direction[i - 1]   # hold previous direction
 
-        last_st = supertrend.iloc[-1]
-        if pd.isna(last_st):
-            return None, None
-        return float(last_st), int(direction.iloc[-1])
+            # Supertrend line follows the active band
+            supertrend[i] = lower_band[i] if direction[i] == 1 else upper_band[i]
+
+        return pd.DataFrame({'supertrend': supertrend, 'direction': direction}, index=df.index)
 
     except Exception:
+        return None
+
+
+def calculate_supertrend(df: pd.DataFrame, length: int = 10, multiplier: float = 7.0):
+    """Latest (supertrend_value, direction), or (None, None) on failure."""
+    series = calculate_supertrend_series(df, length, multiplier)
+    if series is None or series.empty:
         return None, None
+    last_st = series['supertrend'].iloc[-1]
+    if pd.isna(last_st):
+        return None, None
+    return float(last_st), int(series['direction'].iloc[-1])
+
+
+def calculate_rsi(close: pd.Series, length: int = 14) -> Optional[float]:
+    """Wilder RSI of the last bar, or None if not enough data."""
+    try:
+        close = close.astype(float)
+        if len(close) < length + 1:
+            return None
+        delta = close.diff()
+        gain = delta.clip(lower=0).ewm(alpha=1.0 / length, adjust=False).mean()
+        loss = (-delta.clip(upper=0)).ewm(alpha=1.0 / length, adjust=False).mean()
+        last_loss = float(loss.iloc[-1])
+        if last_loss == 0:
+            return 100.0
+        rs = float(gain.iloc[-1]) / last_loss
+        return round(100.0 - 100.0 / (1.0 + rs), 1)
+    except Exception:
+        return None
+
+
+def calculate_indicators(history: pd.DataFrame) -> Dict[str, Optional[float]]:
+    """
+    Cheap extras from the same 1y OHLC frame: RSI(14), 50/200-day simple
+    averages, 52-week high & distance from it, and 1-year return.
+    Everything is None-safe so a short history never breaks the caller.
+    """
+    close = history['Close'].astype(float)
+    out: Dict[str, Optional[float]] = {
+        'rsi': calculate_rsi(close),
+        'dma50': None, 'dma200': None,
+        'high_52w': None, 'pct_from_52w_high': None,
+        'return_1y': None,
+    }
+    try:
+        last = float(close.iloc[-1])
+        if len(close) >= 50:
+            out['dma50'] = round(float(close.tail(50).mean()), 2)
+        if len(close) >= 200:
+            out['dma200'] = round(float(close.tail(200).mean()), 2)
+        high_col = history['High'].astype(float) if 'High' in history else close
+        hi = float(high_col.tail(252).max())
+        out['high_52w'] = round(hi, 2)
+        if hi > 0:
+            out['pct_from_52w_high'] = round((last / hi - 1.0) * 100.0, 2)
+        first = float(close.iloc[0])
+        if first > 0 and len(close) >= 200:       # only call it "1y" with most of a year
+            out['return_1y'] = round((last / first - 1.0) * 100.0, 2)
+    except Exception:
+        pass
+    return out
 
 
 def parse_rss_feed(url: str, timeout: int = 10) -> List[Dict]:
@@ -124,6 +210,74 @@ def parse_rss_feed(url: str, timeout: int = 10) -> List[Dict]:
     return entries
 
 
+@st.cache_data(ttl=PRICE_TTL, show_spinner=False)
+def _download_price_history(symbol: str, period: str, timeout: int,
+                            delay: float, max_retries: int) -> pd.DataFrame:
+    """
+    Rate-limited, cached yfinance download. Raises on failure so a bad result is
+    never cached. One year of OHLC serves price, day change and Supertrend.
+    """
+    def fetch():
+        df = yf.download(f"{symbol}.NS", period=period, progress=False, timeout=timeout)
+
+        if df is None or df.empty or len(df) < 2:
+            raise ValidationError("Insufficient price data")
+
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.droplevel(1)
+        # Extra safety: flatten any remaining tuple column names
+        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+        return df
+
+    return rate_limited_call(
+        service="yfinance", func=fetch,
+        min_delay=delay, calls_per_minute=30, max_retries=max_retries
+    )
+
+
+@st.cache_data(ttl=PRICE_TTL, show_spinner=False)
+def _download_price_history_batch(symbols: Tuple[str, ...], period: str,
+                                  timeout: int) -> Dict[str, pd.DataFrame]:
+    """
+    One yfinance request for the whole portfolio (cached 15 min per symbol set).
+    Symbols Yahoo can't resolve are simply absent from the result; callers
+    fall back to the single-symbol path for those.
+    """
+    if not symbols:
+        return {}
+
+    tickers = [f"{s}.NS" for s in symbols]
+    raw = yf.download(tickers, period=period, group_by="ticker",
+                      progress=False, threads=True, timeout=timeout)
+
+    histories: Dict[str, pd.DataFrame] = {}
+    if raw is None or raw.empty:
+        return histories
+
+    for sym, ticker in zip(symbols, tickers):
+        try:
+            df = raw[ticker] if isinstance(raw.columns, pd.MultiIndex) else raw
+        except KeyError:
+            continue
+        df = df.dropna(how='all')
+        if len(df) >= 2 and 'Close' in df.columns:
+            histories[sym] = df.copy()
+
+    return histories
+
+
+StockAnalysis = Tuple[Optional[float], Optional[float], Optional[float], Optional[str], Optional[str]]
+
+ANALYSIS_KEYS = ('current_price', 'day_change', 'supertrend', 'status', 'tech_error',
+                 'rsi', 'dma50', 'dma200', 'high_52w', 'pct_from_52w_high', 'return_1y')
+
+
+def empty_analysis(error: Optional[str] = None) -> Dict[str, Any]:
+    d: Dict[str, Any] = {k: None for k in ANALYSIS_KEYS}
+    d['tech_error'] = error
+    return d
+
+
 class YFinanceProvider:
     """Yahoo Finance data provider with rate limiting"""
 
@@ -133,59 +287,221 @@ class YFinanceProvider:
         self.timeout = config.get('rate_limits.timeout', 10)
         self.max_retries = config.get('rate_limits.max_retries', 3)
 
+    def analyse_history(self, history: pd.DataFrame) -> Dict[str, Any]:
+        """Turn a 1y OHLC frame into price, day change, Supertrend status and indicators."""
+        current_price = float(history['Close'].iloc[-1])
+        day_change    = float(current_price - history['Close'].iloc[-2])
+
+        st_length     = self.config.get('technical_indicators.supertrend_length', 10)
+        st_multiplier = self.config.get('technical_indicators.supertrend_multiplier', 7.0)
+
+        supertrend_value, direction = calculate_supertrend(
+            history, length=st_length, multiplier=st_multiplier
+        )
+
+        # Use the direction flag as the definitive signal — NOT a raw price-vs-value
+        # comparison. direction==1 means ST is acting as support below price (uptrend);
+        # direction==-1 means it is resistance above price (downtrend).
+        if supertrend_value is not None and direction is not None:
+            status = "Above Supertrend" if direction == 1 else "Below Supertrend"
+        else:
+            status = None
+
+        result = empty_analysis()
+        result.update({
+            'current_price': current_price,
+            'day_change': day_change,
+            'supertrend': supertrend_value,
+            'status': status,
+        })
+        result.update(calculate_indicators(history))
+        return result
+
+    def get_history(self, symbol: str, batch_symbols: Optional[Tuple[str, ...]] = None
+                    ) -> Optional[pd.DataFrame]:
+        """
+        1y OHLC for one symbol, for charting. Served from the batch cache when
+        the symbol set of the last refresh is passed, otherwise a single cached
+        download. Returns None if no data.
+        """
+        try:
+            symbol_clean = DataValidator.validate_stock_symbol(symbol)
+        except ValidationError:
+            return None
+        if batch_symbols and symbol_clean in batch_symbols:
+            try:
+                hist = _download_price_history_batch(tuple(batch_symbols), "1y",
+                                                     max(self.timeout, 30)).get(symbol_clean)
+                if hist is not None:
+                    return hist
+            except Exception:
+                pass
+        try:
+            return _download_price_history(symbol_clean, "1y", self.timeout,
+                                           self.rate_limit_delay, self.max_retries)
+        except Exception:
+            return None
+
     @ErrorBoundary.handle_errors(
         fallback_value=(None, None, None, None, "YFinance data unavailable"),
         error_message="Failed to fetch stock data from Yahoo Finance"
     )
-    def get_stock_analysis(self, symbol: str) -> Tuple[Optional[float], Optional[float],
-    Optional[float], Optional[str], Optional[str]]:
-        """Fetch stock analysis data with rate limiting"""
-
-        def fetch_data():
-            symbol_clean = DataValidator.validate_stock_symbol(symbol)
-
-            # Fetch recent data for price and day change
-            stock_data = yf.download(f"{symbol_clean}.NS", period="2d",
-                                     progress=False, timeout=self.timeout)
-
-            if stock_data.empty or len(stock_data) < 2:
-                raise ValidationError("Insufficient price data")
-
-            if isinstance(stock_data.columns, pd.MultiIndex):
-                stock_data.columns = stock_data.columns.droplevel(1)
-
-            current_price = float(stock_data.iloc[-1]['Close'])
-            day_change    = float(current_price - stock_data.iloc[-2]['Close'])
-
-            # Fetch longer-term data for Supertrend
-            supertrend_data = yf.download(f"{symbol_clean}.NS", period="1y",
-                                          progress=False, timeout=self.timeout)
-
-            supertrend_value, status = None, None
-
-            if not supertrend_data.empty:
-                if isinstance(supertrend_data.columns, pd.MultiIndex):
-                    supertrend_data.columns = supertrend_data.columns.droplevel(1)
-
-                st_length     = self.config.get('technical_indicators.supertrend_length', 10)
-                st_multiplier = self.config.get('technical_indicators.supertrend_multiplier', 7.0)
-
-                supertrend_value, direction = calculate_supertrend(
-                    supertrend_data, length=st_length, multiplier=st_multiplier
-                )
-
-                if supertrend_value is not None:
-                    status = "Above Supertrend" if current_price > supertrend_value else "Below Supertrend"
-
-            return current_price, day_change, supertrend_value, status, None
-
-        return rate_limited_call(
-            service="yfinance",
-            func=fetch_data,
-            min_delay=self.rate_limit_delay,
-            calls_per_minute=30,
-            max_retries=self.max_retries
+    def get_stock_analysis(self, symbol: str) -> StockAnalysis:
+        """(price, day_change, supertrend, status, error) for one symbol (cached 15 min)"""
+        symbol_clean = DataValidator.validate_stock_symbol(symbol)
+        history = _download_price_history(
+            symbol_clean, "1y", self.timeout, self.rate_limit_delay, self.max_retries
         )
+        a = self.analyse_history(history)
+        return a['current_price'], a['day_change'], a['supertrend'], a['status'], a['tech_error']
+
+    def get_batch_analysis(self, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
+        """
+        Full analysis dicts for many symbols from one Yahoo request. Symbols
+        missing from the batch response are retried individually (rate-limited),
+        so the result always has an entry for every valid input symbol.
+        """
+        clean = []
+        for s in symbols:
+            try:
+                clean.append(DataValidator.validate_stock_symbol(s))
+            except ValidationError:
+                pass
+        unique = tuple(dict.fromkeys(clean))   # dedupe, keep order → stable cache key
+
+        results: Dict[str, Dict[str, Any]] = {}
+        try:
+            histories = _download_price_history_batch(unique, "1y", max(self.timeout, 30))
+        except Exception as e:
+            logger.warning(f"Batch price download failed, falling back to per-symbol: {e}")
+            histories = {}
+
+        for sym in unique:
+            history = histories.get(sym)
+            if history is None:
+                history = self.get_history(sym)
+            if history is None:
+                results[sym] = empty_analysis("No price data from Yahoo")
+                continue
+            try:
+                results[sym] = self.analyse_history(history)
+            except Exception as e:
+                logger.warning(f"{sym}: analysis failed ({e})")
+                results[sym] = empty_analysis(f"Analysis failed: {e}")
+
+        return results
+
+
+def _extract_industry(soup: BeautifulSoup) -> str:
+    """
+    Screener.in classifies companies as a breadcrumb of /market/ links:
+        Sector > Industry > Basic industry > Sub-industry
+        e.g. /market/IN02/ > /market/IN02/IN0201/ > /market/IN02/IN0201/IN020102/ ...
+    The third level ("Auto Components") is the most useful label; fall back to
+    the deepest one available. The legacy /industry/ link is checked last.
+    """
+    by_depth: Dict[int, str] = {}
+    for a in soup.select("a[href^='/market/']"):
+        depth = len([p for p in a['href'].split('/') if p]) - 1   # minus "market"
+        text = a.get_text(strip=True)
+        if depth >= 1 and text and depth not in by_depth:
+            by_depth[depth] = text
+    if by_depth:
+        return by_depth.get(3) or by_depth[max(by_depth)]
+
+    legacy = soup.select_one("a[href*='/industry/']")
+    return legacy.get_text(strip=True) if legacy else "N/A"
+
+
+@st.cache_data(ttl=FUNDAMENTALS_TTL, show_spinner=False)
+def _scrape_company_metrics(symbol: str, timeout: int, delay: float,
+                            max_retries: int) -> Tuple[str, str, str, str, str]:
+    """Scrape name/ROE/ROCE/industry/about from Screener.in (cached 24h)."""
+
+    def fetch_metrics():
+        base_url = f"https://www.screener.in/company/{symbol}/"
+        urls_to_check = [base_url + "consolidated/", base_url]
+
+        company_name, roe, roce, industry, about = symbol, "N/A", "N/A", "N/A", "N/A"
+        last_error: Optional[Exception] = None
+
+        with requests.Session() as session:
+            session.headers.update({'User-Agent': BROWSER_UA})
+
+            for url in urls_to_check:
+                try:
+                    response = session.get(url, timeout=timeout)
+                    response.raise_for_status()
+                except requests.RequestException as e:
+                    last_error = e
+                    continue
+
+                soup = BeautifulSoup(response.text, 'html.parser')
+
+                if company_name == symbol:
+                    name_element = soup.select_one("h1.show-from-tablet-landscape")
+                    if name_element:
+                        company_name = name_element.get_text(strip=True)
+
+                if about == "N/A":
+                    about_section = soup.select_one("div.about p")
+                    if about_section:
+                        about = about_section.get_text(strip=True).replace('...read more', '').strip()
+
+                if roe == "N/A" or roce == "N/A":
+                    for li in soup.select("#top-ratios li"):
+                        name_span   = li.select_one(".name")
+                        number_span = li.select_one(".number")
+                        if name_span and number_span:
+                            ratio_name  = name_span.get_text(strip=True)
+                            ratio_value = number_span.get_text(strip=True)
+                            if "ROE" in ratio_name and roe == "N/A":
+                                roe = ratio_value
+                            elif "ROCE" in ratio_name and roce == "N/A":
+                                roce = ratio_value
+
+                if industry == "N/A":
+                    industry = _extract_industry(soup)
+
+                if all(val != "N/A" for val in [roe, roce, industry, about]):
+                    break
+
+        # Both URLs failed at the network level: raise so nothing is cached and
+        # the retry handler gets a chance.
+        if company_name == symbol and about == "N/A" and last_error is not None:
+            raise last_error
+
+        return company_name, roe, roce, industry, about
+
+    return rate_limited_call(
+        service="screener", func=fetch_metrics,
+        min_delay=delay, calls_per_minute=20, max_retries=max_retries
+    )
+
+
+@st.cache_data(ttl=PRICE_TTL, show_spinner=False)
+def _scrape_fallback_price(symbol: str, timeout: int, delay: float, max_retries: int) -> float:
+    """Scrape the current price from Screener.in (cached 15 min)."""
+
+    def fetch_price():
+        url = f"https://www.screener.in/company/{symbol}/"
+        response = requests.get(url, headers={'User-Agent': BROWSER_UA}, timeout=timeout)
+        response.raise_for_status()
+
+        soup = BeautifulSoup(response.text, 'html.parser')
+        price_element = soup.select_one(".company-info div.flex > h2")
+
+        if price_element:
+            price_match = re.search(r'[\d,.]+', price_element.get_text(strip=True))
+            if price_match:
+                return float(price_match.group().replace(",", ""))
+
+        raise ValidationError("Price element not found")
+
+    return rate_limited_call(
+        service="screener_price", func=fetch_price,
+        min_delay=delay, calls_per_minute=20, max_retries=max_retries
+    )
 
 
 class ScreenerProvider:
@@ -202,72 +518,10 @@ class ScreenerProvider:
         error_message="Failed to fetch data from Screener.in"
     )
     def get_company_metrics(self, symbol: str) -> Tuple[str, str, str, str, str]:
-        """Scrape company metrics from Screener.in with rate limiting"""
-
-        def fetch_metrics():
-            symbol_clean = DataValidator.validate_stock_symbol(symbol)
-
-            base_url = f"https://www.screener.in/company/{symbol_clean}/"
-            urls_to_check = [base_url + "consolidated/", base_url]
-
-            company_name, roe, roce, industry, about = symbol_clean, "N/A", "N/A", "N/A", "N/A"
-
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36'
-            }
-
-            with requests.Session() as session:
-                session.headers.update(headers)
-
-                for url in urls_to_check:
-                    try:
-                        response = session.get(url, timeout=self.timeout)
-                        response.raise_for_status()
-
-                        soup = BeautifulSoup(response.text, 'html.parser')
-
-                        if company_name == symbol_clean:
-                            name_element = soup.select_one("h1.show-from-tablet-landscape")
-                            if name_element:
-                                company_name = name_element.get_text(strip=True)
-
-                        if about == "N/A":
-                            about_section = soup.select_one("div.about p")
-                            if about_section:
-                                about = about_section.get_text(strip=True).replace('...read more', '').strip()
-
-                        if roe == "N/A" or roce == "N/A":
-                            ratio_elements = soup.select("#top-ratios li")
-                            for li in ratio_elements:
-                                name_span   = li.select_one(".name")
-                                number_span = li.select_one(".number")
-                                if name_span and number_span:
-                                    ratio_name  = name_span.get_text(strip=True)
-                                    ratio_value = number_span.get_text(strip=True)
-                                    if "ROE" in ratio_name and roe == "N/A":
-                                        roe = ratio_value
-                                    elif "ROCE" in ratio_name and roce == "N/A":
-                                        roce = ratio_value
-
-                        if industry == "N/A":
-                            industry_tag = soup.select_one(".company-info .flex-row a[href*='/industry/']")
-                            if industry_tag:
-                                industry = industry_tag.get_text(strip=True)
-
-                        if all(val != "N/A" for val in [roe, roce, industry, about]):
-                            break
-
-                    except requests.RequestException:
-                        continue
-
-            return company_name, roe, roce, industry, about
-
-        return rate_limited_call(
-            service="screener",
-            func=fetch_metrics,
-            min_delay=self.rate_limit_delay,
-            calls_per_minute=20,
-            max_retries=self.max_retries
+        """Company name, ROE, ROCE, industry, about (cached 24h)"""
+        symbol_clean = DataValidator.validate_stock_symbol(symbol)
+        return _scrape_company_metrics(
+            symbol_clean, self.timeout, self.rate_limit_delay, self.max_retries
         )
 
     @ErrorBoundary.handle_errors(
@@ -275,34 +529,45 @@ class ScreenerProvider:
         error_message="Failed to get fallback price from Screener.in"
     )
     def get_fallback_price(self, symbol: str) -> Optional[float]:
-        """Get current price as fallback when YFinance fails"""
+        """Current price as fallback when YFinance fails (cached 15 min)"""
+        symbol_clean = DataValidator.validate_stock_symbol(symbol)
+        return _scrape_fallback_price(
+            symbol_clean, self.timeout, self.rate_limit_delay, self.max_retries
+        )
 
-        def fetch_price():
-            symbol_clean = DataValidator.validate_stock_symbol(symbol)
-            url = f"https://www.screener.in/company/{symbol_clean}/"
 
-            headers = {'User-Agent': 'Mozilla/5.0'}
-            response = requests.get(url, headers=headers, timeout=self.timeout)
+@st.cache_data(ttl=SCAN_TTL, show_spinner=False)
+def _run_chartink_scan(scan_clause: str, timeout: int, delay: float,
+                       max_retries: int) -> pd.DataFrame:
+    """Execute a Chartink scan (cached 15 min per clause)."""
+
+    def execute_scan():
+        with requests.Session() as session:
+            session.headers.update({'User-Agent': BROWSER_UA})
+
+            response = session.get("https://chartink.com/screener/dashboard", timeout=timeout)
             response.raise_for_status()
 
             soup = BeautifulSoup(response.text, 'html.parser')
-            price_element = soup.select_one(".company-info div.flex > h2")
+            csrf_token = soup.find('meta', {'name': 'csrf-token'})
+            if not csrf_token:
+                raise ValidationError("Could not find CSRF token")
 
-            if price_element:
-                price_text  = price_element.get_text(strip=True)
-                price_match = re.search(r'[\d,.]+', price_text)
-                if price_match:
-                    return float(price_match.group().replace(",", ""))
+            csrf_token = csrf_token['content']
+            session.headers.update({'X-CSRF-TOKEN': csrf_token})
 
-            raise ValidationError("Price element not found")
+            payload = {'scan_clause': scan_clause, '_token': csrf_token}
+            post_response = session.post("https://chartink.com/screener/process",
+                                         data=payload, timeout=timeout)
+            post_response.raise_for_status()
 
-        return rate_limited_call(
-            service="screener_price",
-            func=fetch_price,
-            min_delay=self.rate_limit_delay,
-            calls_per_minute=20,
-            max_retries=self.max_retries
-        )
+            scan_results = post_response.json().get('data', [])
+            return pd.DataFrame(scan_results) if scan_results else pd.DataFrame()
+
+    return rate_limited_call(
+        service="chartink", func=execute_scan,
+        min_delay=delay, calls_per_minute=10, max_retries=max_retries
+    )
 
 
 class ChartinkProvider:
@@ -320,114 +585,225 @@ class ChartinkProvider:
         show_details=True
     )
     def run_scan(self, scan_clause: str) -> pd.DataFrame:
-        """Run Chartink scan with rate limiting"""
-
-        def execute_scan():
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36'
-            }
-
-            with requests.Session() as session:
-                session.headers.update(headers)
-
-                screener_url = "https://chartink.com/screener/dashboard"
-                response = session.get(screener_url, timeout=self.timeout)
-                response.raise_for_status()
-
-                soup = BeautifulSoup(response.text, 'html.parser')
-                csrf_token = soup.find('meta', {'name': 'csrf-token'})
-
-                if not csrf_token:
-                    raise ValidationError("Could not find CSRF token")
-
-                csrf_token = csrf_token['content']
-                session.headers.update({'X-CSRF-TOKEN': csrf_token})
-
-                payload      = {'scan_clause': scan_clause, '_token': csrf_token}
-                process_url  = "https://chartink.com/screener/process"
-                post_response = session.post(process_url, data=payload, timeout=self.timeout)
-                post_response.raise_for_status()
-
-                scan_results = post_response.json().get('data', [])
-                return pd.DataFrame(scan_results) if scan_results else pd.DataFrame()
-
-        return rate_limited_call(
-            service="chartink",
-            func=execute_scan,
-            min_delay=self.rate_limit_delay,
-            calls_per_minute=10,
-            max_retries=self.max_retries
+        """Run Chartink scan (cached 15 min per clause)"""
+        return _run_chartink_scan(
+            scan_clause, self.timeout, self.rate_limit_delay, self.max_retries
         )
+
+
+# VADER is a social-media lexicon: "Sensex crashes 800 points as banks slump"
+# scores 0.0 out of the box. These finance terms are overlaid on top of it.
+# Scale matches VADER (-4 … +4).
+FINANCE_LEXICON: Dict[str, float] = {
+    # --- negative ---
+    'crash': -3.0, 'crashes': -3.0, 'crashed': -3.0,
+    'plunge': -3.0, 'plunges': -3.0, 'plunged': -3.0,
+    'rout': -3.0, 'recession': -3.0, 'bankruptcy': -3.5, 'fraud': -3.5, 'scam': -3.5,
+    'slump': -2.5, 'slumps': -2.5, 'slumped': -2.5,
+    'tumble': -2.5, 'tumbles': -2.5, 'tumbled': -2.5,
+    'tank': -2.5, 'tanks': -2.5, 'tanked': -2.5,
+    'sell-off': -2.5, 'selloff': -2.5, 'downgrade': -2.5, 'downgrades': -2.5, 'downgraded': -2.5,
+    'default': -2.5, 'defaults': -2.5, 'layoffs': -2.5, 'penalty': -2.0, 'probe': -2.0,
+    'sink': -2.0, 'sinks': -2.0, 'sank': -2.0, 'loss': -2.0, 'losses': -2.0,
+    'miss': -2.0, 'misses': -2.0, 'missed': -2.0, 'bearish': -2.0, 'weak': -1.8, 'weakness': -1.8,
+    'slide': -1.8, 'slides': -1.8, 'slid': -1.8, 'drag': -1.5, 'drags': -1.5, 'dragged': -1.5,
+    'fall': -1.5, 'falls': -1.5, 'fell': -1.5, 'drop': -1.5, 'drops': -1.5, 'dropped': -1.5,
+    'decline': -1.5, 'declines': -1.5, 'declined': -1.5, 'bear': -1.5,
+    'outflow': -1.5, 'outflows': -1.5, 'correction': -1.5, 'cut': -1.2, 'cuts': -1.2,
+    'npa': -2.5, 'npas': -2.5, 'writedown': -2.5, 'write-off': -2.5, 'impairment': -2.5,
+    'dip': -1.0, 'dips': -1.0, 'dipped': -1.0, 'volatile': -1.0, 'volatility': -1.0,
+    'inflation': -1.0, 'debt': -1.0, 'pressure': -1.0, 'lower': -1.0, 'low': -1.0, 'red': -1.0,
+    # --- positive ---
+    'surge': 3.0, 'surges': 3.0, 'surged': 3.0,
+    'soar': 3.0, 'soars': 3.0, 'soared': 3.0,
+    'rally': 2.5, 'rallies': 2.5, 'rallied': 2.5,
+    'upgrade': 2.5, 'upgrades': 2.5, 'upgraded': 2.5, 'bullish': 2.5,
+    'outperform': 2.5, 'outperforms': 2.5, 'outperformed': 2.5,
+    'jump': 2.0, 'jumps': 2.0, 'jumped': 2.0, 'gain': 2.0, 'gains': 2.0, 'gained': 2.0,
+    'beat': 2.0, 'beats': 2.0, 'rebound': 2.0, 'rebounds': 2.0, 'rebounded': 2.0,
+    'breakout': 2.0, 'buyback': 2.0,
+    'rise': 1.5, 'rises': 1.5, 'rose': 1.5, 'climb': 1.5, 'climbs': 1.5, 'climbed': 1.5,
+    'profit': 1.5, 'profits': 1.5, 'growth': 1.5, 'strong': 1.5, 'dividend': 1.5,
+    'inflow': 1.5, 'inflows': 1.5, 'recovery': 1.5, 'recovers': 1.5, 'boost': 1.5, 'boosts': 1.5,
+    'bull': 1.5, 'higher': 1.0, 'high': 1.0, 'green': 1.0, 'upbeat': 1.5,
+    # --- finance nouns VADER reads emotionally ("share" = sharing, "trust", "gross") ---
+    'share': 0.0, 'shares': 0.0, 'interest': 0.0, 'credit': 0.0, 'trust': 0.0,
+    'security': 0.0, 'securities': 0.0, 'treasury': 0.0, 'value': 0.0, 'worth': 0.0,
+    'gross': 0.0, 'asset': 0.0, 'assets': 0.0,
+}
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _fetch_rss_entries(url: str, timeout: int) -> List[Dict]:
+    """Fetch RSS entries (cached 30 min per URL, politely rate-limited)."""
+    return rate_limited_call(
+        service="google_news", func=lambda: parse_rss_feed(url, timeout=timeout),
+        min_delay=0.5, calls_per_minute=40, max_retries=2
+    )
+
+
+def _google_news_url(query: str) -> str:
+    return f"https://news.google.com/rss/search?q={quote(query)}&hl=en-IN&gl=IN&ceid=IN:en"
+
+
+def _parse_pub_date(text: str) -> Optional[datetime]:
+    """RSS pubDate (RFC 2822) → aware datetime, or None."""
+    try:
+        return parsedate_to_datetime(text)
+    except Exception:
+        return None
+
+
+# Suffixes that make a company name a worse search term than the bare name
+_NAME_NOISE = re.compile(r'\b(ltd|limited|pvt|private|inc|corp|corporation|co)\b\.?', re.I)
+
+
+def news_search_term(company_name: str, symbol: str) -> str:
+    """'Banco Products (India) Ltd' → 'Banco Products'; falls back to the symbol."""
+    name = company_name or ''
+    name = re.sub(r'\(.*?\)', ' ', name)          # drop parentheticals
+    name = _NAME_NOISE.sub(' ', name)
+    name = re.sub(r'[^\w&\s-]', ' ', name)
+    name = ' '.join(name.split())
+    return name if len(name) >= 3 else symbol
 
 
 class NewsProvider:
     """News data provider with sentiment analysis"""
 
+    # Google News appends " - Publisher" to every headline; strip it before scoring
+    _SOURCE_SUFFIX = re.compile(r'\s+-\s+[^-]+$')
+
     def __init__(self, config: Config):
         self.config = config
         self.max_articles = config.get('news.max_articles', 20)
-        self.analyzer = SentimentIntensityAnalyzer()
+        self.timeout = config.get('rate_limits.timeout', 10)
+        self._analyzer = None          # created lazily — see _get_analyzer
+        self._analyzer_failed = False
+
+    def _get_analyzer(self):
+        """
+        Build the VADER analyzer on first use, downloading the lexicon if needed.
+        Never raises: if VADER is unavailable, sentiment degrades to Neutral and
+        the rest of the app keeps working.
+        """
+        if self._analyzer is not None or self._analyzer_failed:
+            return self._analyzer
+        try:
+            import nltk
+            from nltk.sentiment.vader import SentimentIntensityAnalyzer
+            try:
+                nltk.data.find('sentiment/vader_lexicon.zip')
+            except LookupError:
+                nltk.download('vader_lexicon', quiet=True)
+            analyzer = SentimentIntensityAnalyzer()
+            analyzer.lexicon.update(FINANCE_LEXICON)
+            self._analyzer = analyzer
+        except Exception as e:
+            logger.warning(f"Sentiment analyzer unavailable, defaulting to Neutral: {e}")
+            self._analyzer_failed = True
+            st.warning("Sentiment analysis unavailable (VADER lexicon could not be loaded). "
+                       "Headlines will be shown as Neutral.")
+        return self._analyzer
 
     @ErrorBoundary.handle_errors(
         fallback_value=[],
         error_message="Failed to fetch news data"
     )
-    def get_news_from_rss(self, portfolio_stocks: List[Dict]) -> List[Dict]:
-        """Fetch and analyse news with portfolio relevance — no feedparser needed."""
+    def get_news_from_rss(self, portfolio_stocks: List[Dict],
+                          include_holdings: bool = True,
+                          per_holding: int = 3) -> List[Dict]:
+        """
+        Market-wide headlines plus (optionally) a targeted search per holding.
+        Per-holding articles are tagged with that holding's symbol, so relevance
+        is exact rather than substring luck. Newest first, de-duplicated by link.
+        """
+        market_query = '"Indian stock market" OR "NSE" OR "BSE" OR "Sensex"'
+        jobs: List[Tuple[str, Optional[str], int]] = [(market_query, None, self.max_articles)]
 
-        query = '"Indian stock market" OR "NSE" OR "BSE" OR "Sensex"'
-        url   = f"https://news.google.com/rss/search?q={quote(query)}&hl=en-IN&gl=IN&ceid=IN:en"
-
-        raw_entries = parse_rss_feed(url, timeout=10)
-        if not raw_entries:
-            raise ValidationError("No news articles found")
+        if include_holdings:
+            for s in portfolio_stocks:
+                sym = s['symbol'].split('-')[0]
+                term = news_search_term(s.get('company_name', sym), sym)
+                # "stock"/"share" keeps the search on the listed company rather than its products
+                jobs.append((f'"{term}" (stock OR share OR shares OR NSE)', sym, per_holding))
 
         stock_names   = [s.get('company_name', s['symbol']) for s in portfolio_stocks]
         stock_symbols = [s['symbol'].split('-')[0] for s in portfolio_stocks]
 
-        articles = []
-        for entry in raw_entries[:self.max_articles]:
-            title     = entry.get('title', '')
-            sentiment = self._get_sentiment(title)
-            affected_stocks = []
+        articles: Dict[str, Dict] = {}     # link → article (dedupe across searches)
+        failures = 0
+        for query, tagged_symbol, limit in jobs:
+            try:
+                entries = _fetch_rss_entries(_google_news_url(query), self.timeout)
+            except Exception as e:
+                failures += 1
+                logger.warning(f"News search failed for {tagged_symbol or 'market'}: {e}")
+                continue
 
-            title_lower = title.lower()
-            for i, name in enumerate(stock_names):
-                sym = stock_symbols[i]
-                if name.lower() in title_lower or sym.lower() in title_lower:
-                    affected_stocks.append(sym)
+            for entry in entries[:limit]:
+                title    = entry.get('title', '')
+                headline = self._SOURCE_SUFFIX.sub('', title).strip() or title
+                link     = entry.get('link', '#')
 
-            articles.append({
-                "headline": title,
-                "link":      entry.get('link', '#'),
-                "source":    entry.get('source', 'N/A'),
-                "published": entry.get('published', 'N/A'),
-                "sentiment": sentiment,
-                "affected":  list(set(affected_stocks))
-            })
+                if link in articles:
+                    if tagged_symbol and tagged_symbol not in articles[link]['affected']:
+                        articles[link]['affected'].append(tagged_symbol)
+                    continue
 
-        return articles
+                sentiment, score = self._get_sentiment(headline)
+                affected = [tagged_symbol] if tagged_symbol else []
+                title_lower = headline.lower()
+                for name, sym in zip(stock_names, stock_symbols):
+                    if sym in affected:
+                        continue
+                    # Symbols shorter than 4 chars match inside ordinary words; require the name
+                    if name.lower() in title_lower or (len(sym) >= 4 and sym.lower() in title_lower):
+                        affected.append(sym)
 
-    def _get_sentiment(self, text: str) -> str:
-        """Analyse text sentiment"""
+                published_at = _parse_pub_date(entry.get('published', ''))
+                articles[link] = {
+                    "headline":     headline,
+                    "link":         link,
+                    "source":       entry.get('source', 'N/A'),
+                    "published":    entry.get('published', 'N/A'),
+                    "published_at": published_at.isoformat() if published_at else None,
+                    "sentiment":    sentiment,
+                    "score":        score,
+                    "affected":     affected,
+                }
+
+        if not articles:
+            raise ValidationError("No news articles found" + (f" ({failures} searches failed)" if failures else ""))
+
+        return sorted(articles.values(), key=lambda a: a['published_at'] or '', reverse=True)
+
+    def _get_sentiment(self, text: str) -> Tuple[str, float]:
+        """Classify text; returns (label, compound score)."""
+        analyzer = self._get_analyzer()
+        if analyzer is None:
+            return "Neutral", 0.0
         try:
-            score = self.analyzer.polarity_scores(text)['compound']
-            if score >= 0.05:
-                return "Positive"
-            elif score <= -0.05:
-                return "Negative"
-            else:
-                return "Neutral"
+            score = analyzer.polarity_scores(text)['compound']
         except Exception:
-            return "Neutral"
+            return "Neutral", 0.0
+        if score >= 0.05:
+            return "Positive", score
+        if score <= -0.05:
+            return "Negative", score
+        return "Neutral", score
 
 
 class AIProvider:
-    """AI-based analysis provider"""
+    """AI-based analysis provider (Google Gemini)"""
+
+    MODEL = "gemini-2.5-flash"
 
     def __init__(self, config: Config):
         self.config = config
-        self.timeout = config.get('rate_limits.timeout', 45)
+        self.model = config.get('ai.gemini_model', self.MODEL)
+        # LLM calls are slower than scrapes; give them more headroom
+        self.timeout = max(config.get('rate_limits.timeout', 10), 45)
 
     @ErrorBoundary.handle_errors(
         fallback_value={},
@@ -443,16 +819,24 @@ class AIProvider:
             prompt = self._create_industry_prompt(stocks_data)
             url    = (
                 "https://generativelanguage.googleapis.com/v1beta/models/"
-                f"gemini-1.5-flash-latest:generateContent?key={api_key}"
+                f"{self.model}:generateContent"
             )
-            payload = {"contents": [{"parts": [{"text": prompt}]}]}
+            payload = {
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"responseMimeType": "application/json"}
+            }
 
+            # Key goes in a header, never the URL: requests embeds the URL in
+            # exception messages, which would otherwise leak the key into the UI/logs.
             response = requests.post(
                 url,
-                headers={'Content-Type': 'application/json'},
+                headers={'Content-Type': 'application/json', 'x-goog-api-key': api_key},
                 json=payload,
                 timeout=self.timeout
             )
+            if response.status_code in (400, 401, 403):
+                raise ValidationError(f"Gemini rejected the request ({response.status_code}): "
+                                      "check the API key and model name")
             response.raise_for_status()
 
             result = response.json()
@@ -465,7 +849,10 @@ class AIProvider:
             if not json_match:
                 raise ValidationError("Could not extract JSON from AI response")
 
-            return json.loads(json_match.group(0))
+            parsed = json.loads(json_match.group(0))
+            if not isinstance(parsed, dict):
+                raise ValidationError("AI response was not a JSON object")
+            return {str(k): str(v) for k, v in parsed.items()}
 
         return rate_limited_call(
             service="gemini_ai",
@@ -497,8 +884,25 @@ class DataSourceManager:
         self.news     = NewsProvider(config)
         self.ai       = AIProvider(config)
 
+    # --- Thread-safe raw fetchers -------------------------------------------
+    # These call the cached scrapers directly and make NO Streamlit calls, so
+    # they can run inside a ThreadPoolExecutor. They raise on failure; the
+    # caller (on the script thread) decides how to report it.
+
+    def fetch_company_metrics_raw(self, symbol: str) -> Tuple[str, str, str, str, str]:
+        s = self.screener
+        return _scrape_company_metrics(
+            DataValidator.validate_stock_symbol(symbol), s.timeout, s.rate_limit_delay, s.max_retries
+        )
+
+    def fetch_fallback_price_raw(self, symbol: str) -> float:
+        s = self.screener
+        return _scrape_fallback_price(
+            DataValidator.validate_stock_symbol(symbol), s.timeout, s.rate_limit_delay, s.max_retries
+        )
+
     def get_stock_data(self, symbol: str) -> Dict[str, Any]:
-        """Get comprehensive stock data from multiple sources"""
+        """Get comprehensive stock data from multiple sources (single-stock path)"""
         current_price, day_change, supertrend, status, error = self.yfinance.get_stock_analysis(symbol)
 
         if current_price is None:

@@ -2,6 +2,7 @@
 import functools
 import traceback
 from typing import Any, Callable, Optional, Union
+import pandas as pd
 import streamlit as st
 import logging
 
@@ -76,14 +77,14 @@ class DataValidator:
         if missing_columns:
             raise ValidationError(f"Missing required columns: {missing_columns}")
 
-        # Check for numeric columns
+        # Coerce numeric columns; fail only if nothing in the column is numeric
         numeric_columns = ['Quantity Available', 'Average Price']
         for col in numeric_columns:
-            if not df[col].dtype.kind in 'biufc':  # numeric types
-                try:
-                    df[col] = pd.to_numeric(df[col], errors='coerce')
-                except:
-                    raise ValidationError(f"Column {col} contains invalid numeric data")
+            if df[col].dtype.kind not in 'biufc':  # not already numeric
+                coerced = pd.to_numeric(df[col], errors='coerce')
+                if coerced.notna().sum() == 0:
+                    raise ValidationError(f"Column {col} contains no numeric data")
+                df[col] = coerced
 
         return True
 
@@ -169,17 +170,17 @@ class ProgressTracker:
         with self.error_container:
             if len(self.errors) == 1:  # First error
                 st.warning("Some items encountered errors:")
-            st.caption(f"âŒ {item_name}: {error_message}" if item_name else f"âŒ {error_message}")
+            st.caption(f"❌ {item_name}: {error_message}" if item_name else f"❌ {error_message}")
 
     def finish(self):
         """Clean up progress tracking"""
         self.progress_bar.empty()
 
         if self.errors:
-            with st.expander(f"âš ï¸ {len(self.errors)} errors encountered", expanded=False):
+            with st.expander(f"⚠️ {len(self.errors)} errors encountered", expanded=False):
                 for error in self.errors:
-                    st.text(f"â€¢ {error['item']}: {error['message']}" if error['item']
-                            else f"â€¢ {error['message']}")
+                    st.text(f"• {error['item']}: {error['message']}" if error['item']
+                            else f"• {error['message']}")
 
 
 # Decorator for progress tracking

@@ -1,12 +1,14 @@
 # main.py - Stock Dashboard
+import io
 import streamlit as st
 import pandas as pd
 from typing import List, Dict, Any
 
 # Import our modular components
+import charts
 from config import Config
-from portfolio_manager import PortfolioManager, ETFManager
-from data_sources import DataSourceManager
+from portfolio_manager import PortfolioManager, ETFManager, PortfolioStore, PortfolioHistory
+from data_sources import DataSourceManager, calculate_supertrend_series
 from error_handler import ErrorBoundary, safe_execute
 from screen_builder import ScreenerBuilder
 
@@ -29,7 +31,21 @@ class StockDashboardApp:
         self.screener_builder = ScreenerBuilder(self.config)
 
         if 'portfolio_data' not in st.session_state:
-            st.session_state.portfolio_data = []
+            # Open with the last refresh instead of an empty page
+            saved = PortfolioStore.load()
+            if saved:
+                st.session_state.portfolio_data = saved['stocks']
+                st.session_state.total_investment = saved.get('total_investment') or 0
+                st.session_state.portfolio_saved_at = saved.get('saved_at', 'Unknown')
+                st.session_state.signal_changes = saved.get('signal_changes', [])
+                meta = saved.get('meta') or {}
+                if meta.get('benchmark_symbol'):
+                    st.session_state.benchmark_info = {'symbol': meta['benchmark_symbol'],
+                                                       'return_1y': meta.get('benchmark_return_1y')}
+                if meta.get('price_batch_symbols'):
+                    st.session_state.price_batch_symbols = tuple(meta['price_batch_symbols'])
+            else:
+                st.session_state.portfolio_data = []
         if 'total_investment' not in st.session_state:
             st.session_state.total_investment = 0
 
@@ -46,28 +62,52 @@ class StockDashboardApp:
         with st.sidebar:
             st.header("⚙️ Configuration")
 
-            api_key = st.text_input(
-                "Gemini API Key",
-                type="password",
-                help="Optional: For AI-based industry classification"
-            )
-            if api_key:
-                st.session_state.gemini_api_key = api_key
+            secret_key = self._secret("GEMINI_API_KEY")
+            if secret_key:
+                st.session_state.gemini_api_key = secret_key
+                st.caption("🔑 Gemini key loaded from `.streamlit/secrets.toml`")
+            else:
+                api_key = st.text_input(
+                    "Gemini API Key",
+                    type="password",
+                    help="Optional: for AI-based industry classification. "
+                         "Put GEMINI_API_KEY in .streamlit/secrets.toml to skip this box."
+                )
+                if api_key:
+                    st.session_state.gemini_api_key = api_key
 
             st.header("🔄 Data Controls")
 
             refresh_button = st.button(
                 "🔄 Refresh Portfolio",
                 type="primary",
-                help="Reload portfolio data from Excel file"
+                help="Fetch fresh prices and fundamentals for every holding",
+                width="stretch"
             )
 
             if refresh_button:
                 self._refresh_portfolio_data()
 
+            saved_at = st.session_state.get('portfolio_saved_at')
+            if saved_at and st.session_state.get('portfolio_data'):
+                st.caption(f"🕒 Data as of {saved_at}")
+
+            uploaded = st.file_uploader(
+                "📤 Upload holdings (.xlsx)",
+                type=["xlsx", "xls"],
+                help="Your broker's holdings export. Saved locally and reused next time."
+            )
+            if uploaded is not None:
+                signature = (uploaded.name, uploaded.size)
+                if st.session_state.get('uploaded_signature') != signature:
+                    path = self.portfolio_manager.save_uploaded_file(uploaded)
+                    st.session_state.uploaded_signature = signature
+                    st.toast(f"Saved {uploaded.name} → {path}. Click Refresh Portfolio.")
+                    st.rerun()
+
             portfolio_file = self.config.get('data_sources.portfolio_file')
             if portfolio_file:
-                st.info(f"📄 Portfolio File: `{portfolio_file}`")
+                st.caption(f"📄 Using `{portfolio_file}`")
             else:
                 st.error("❌ No portfolio file configured")
 
@@ -85,6 +125,14 @@ class StockDashboardApp:
                         "Supertrend Multiplier": self.config.get('technical_indicators.supertrend_multiplier')
                     }
                 })
+
+    @staticmethod
+    def _secret(name: str):
+        """Read a value from st.secrets; None if no secrets file or key."""
+        try:
+            return st.secrets.get(name)
+        except Exception:
+            return None
 
     def _refresh_portfolio_data(self):
         def refresh_operation():
@@ -104,8 +152,9 @@ class StockDashboardApp:
                 st.rerun()
 
     def _render_main_content(self):
-        tab1, tab2, tab3, tab4 = st.tabs([
+        tab1, tab2, tab3, tab4, tab5 = st.tabs([
             "📈 Portfolio Analysis",
+            "👁️ Watchlist",
             "📰 News & Sentiment",
             "🔍 Stock Screener",
             "⚙️ Settings"
@@ -114,11 +163,95 @@ class StockDashboardApp:
         with tab1:
             self._render_portfolio_tab()
         with tab2:
-            self._render_news_tab()
+            self._render_watchlist_tab()
         with tab3:
-            self._render_screener_tab()
+            self._render_news_tab()
         with tab4:
+            self._render_screener_tab()
+        with tab5:
             self._render_settings_tab()
+
+    # ------------------------------------------------------------------ helpers
+
+    def _held_symbols(self) -> set:
+        return {s.get('api_symbol') or s['symbol'].split('-')[0]
+                for s in st.session_state.get('portfolio_data', [])}
+
+    def _watchlist(self) -> List[str]:
+        return list(self.config.get('watchlist', []) or [])
+
+    def _save_watchlist(self, symbols: List[str]):
+        cleaned = list(dict.fromkeys(s.strip().upper() for s in symbols if s and s.strip()))
+        self.config.set('watchlist', cleaned)
+
+    def _render_signal_alerts(self):
+        changes = st.session_state.get('signal_changes') or []
+        if not changes:
+            return
+        st.subheader("🔔 Supertrend flips since last refresh")
+        for c in changes:
+            up = c['to'] == "Above Supertrend"
+            text = (f"**{c['symbol']}** flipped {'🟢 above' if up else '🔴 below'} Supertrend "
+                    f"(was *{c['from']}* at {c['since']})")
+            (st.success if up else st.error)(text)
+        if st.button("Dismiss alerts", key="dismiss_alerts"):
+            st.session_state.signal_changes = []
+            saved = PortfolioStore.load()
+            if saved:
+                PortfolioStore.save(saved['stocks'], saved.get('total_investment') or 0, [])
+            st.rerun()
+
+    def _render_allocation(self, display_df: pd.DataFrame):
+        st.subheader("🥧 Allocation")
+        threshold = float(self.config.get('portfolio.concentration_threshold', 15))
+        by = st.radio("Group by", ["Symbol", "Industry"], horizontal=True,
+                      label_visibility="collapsed", key="alloc_by")
+        chart = charts.allocation_chart(display_df, by=by, concentration_threshold=threshold)
+        if chart is None:
+            st.info("No priced holdings to chart yet.")
+            return
+        st.altair_chart(chart, width="stretch")
+        priced = display_df[display_df['Current Value'] > 0]
+        heavy = priced[priced['Weight %'] >= threshold]
+        if not heavy.empty:
+            st.caption(f"⚠️ {len(heavy)} holding(s) at or above {threshold:.0f}% of portfolio value: "
+                       f"{', '.join(heavy.index)}")
+
+    def _render_value_history(self):
+        hist = PortfolioHistory.load()
+        if hist.empty:
+            return
+        with st.expander(f"📉 Value over time · {len(hist)} refresh day(s)", expanded=len(hist) > 1):
+            if len(hist) < 2:
+                st.caption("Refresh on another day to start seeing a trend. Each day's last refresh is logged.")
+            chart = charts.history_chart(hist)
+            if chart is not None:
+                st.altair_chart(chart, width="stretch")
+            first, last = hist.iloc[0], hist.iloc[-1]
+            if len(hist) > 1 and first['current_value']:
+                delta = last['current_value'] - first['current_value']
+                st.caption(f"Since {pd.to_datetime(first['date']).strftime('%d %b %Y')}: "
+                           f"₹{delta:+,.0f} ({delta / first['current_value'] * 100:+.1f}%)")
+
+    def _render_export(self, display_df: pd.DataFrame, filename_stem: str):
+        stamp = pd.Timestamp.now().strftime('%Y%m%d_%H%M')
+        col1, col2, _ = st.columns([1, 1, 4])
+        with col1:
+            st.download_button("📥 CSV", data=display_df.to_csv().encode('utf-8'),
+                               file_name=f"{filename_stem}_{stamp}.csv", mime="text/csv",
+                               width="stretch")
+        with col2:
+            buf = io.BytesIO()
+            with pd.ExcelWriter(buf, engine='openpyxl') as xw:
+                display_df.to_excel(xw, sheet_name=filename_stem[:31])
+                ws = xw.sheets[filename_stem[:31]]
+                for column in ws.columns:
+                    width = max(len(str(c.value)) if c.value is not None else 0 for c in column)
+                    ws.column_dimensions[column[0].column_letter].width = min(max(10, width + 2), 45)
+            st.download_button("📥 Excel", data=buf.getvalue(),
+                               file_name=f"{filename_stem}_{stamp}.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                               width="stretch")
 
     @ErrorBoundary.handle_errors(error_message="Error rendering portfolio tab", show_details=True)
     def _render_portfolio_tab(self):
@@ -132,37 +265,116 @@ class StockDashboardApp:
             return
 
         summary = self.portfolio_manager.calculate_portfolio_summary(portfolio_data)
+        partial = summary['valid_prices'] < summary['total_stocks']
+
+        saved_at = st.session_state.get('portfolio_saved_at')
+        if saved_at:
+            st.caption(f"🕒 Data as of {saved_at} — use the sidebar to refresh")
 
         col1, col2, col3, col4 = st.columns(4)
         with col1:
-            st.metric("💰 Total Investment", f"₹{st.session_state.get('total_investment', 0):,.2f}")
+            st.metric("💰 Total Investment", f"₹{summary['invested_total']:,.2f}",
+                      help="Avg price × qty across all holdings")
         with col2:
             current_value = summary['current_value']
+            # Compare against what was invested in the *priced* stocks only,
+            # otherwise a missing price shows up as a loss.
             st.metric(
                 "📈 Current Value",
                 f"₹{current_value:,.2f}",
-                delta=f"₹{current_value - st.session_state.get('total_investment', 0):,.2f}"
+                delta=f"₹{current_value - summary['invested_priced']:,.2f}",
+                help="Sum over holdings with a live price" + (" (partial)" if partial else "")
             )
         with col3:
             total_pnl = summary['total_pnl']
-            pnl_color = "normal" if total_pnl >= 0 else "inverse"
-            st.metric("💵 Total P/L", f"₹{total_pnl:,.2f}", delta_color=pnl_color)
+            pnl_pct = (total_pnl / summary['invested_priced'] * 100) if summary['invested_priced'] else 0
+            st.metric("💵 Total P/L", f"₹{total_pnl:,.2f}", delta=f"{pnl_pct:+.2f}%")
         with col4:
-            st.metric("📊 Data Coverage", f"{summary['valid_prices']}/{summary['total_stocks']} stocks")
+            day = summary['day_change']
+            st.metric("📅 Today", f"₹{day:,.2f}", delta=f"{day:+,.0f}",
+                      help="Sum of (day change × qty) over priced holdings")
+
+        if partial:
+            missing = summary['total_stocks'] - summary['valid_prices']
+            st.warning(f"⚠️ {missing} of {summary['total_stocks']} holdings have no price data — "
+                       f"totals above cover ₹{summary['invested_priced']:,.0f} of "
+                       f"₹{summary['invested_total']:,.0f} invested.")
+
+        bench = st.session_state.get('benchmark_info') or {}
+        if bench.get('return_1y') is not None:
+            beating = sum(1 for s in portfolio_data if (s.get('vs_benchmark_1y') or 0) > 0)
+            comparable = sum(1 for s in portfolio_data if s.get('vs_benchmark_1y') is not None)
+            st.caption(f"📐 Benchmark {bench['symbol']} 1-year return: {bench['return_1y']:+.1f}% · "
+                       f"{beating}/{comparable} holdings beat it over the same window")
+
+        self._render_signal_alerts()
+        self._render_value_history()
 
         st.header("🏢 Holdings Summary")
         display_df = self.portfolio_manager.get_portfolio_display_data(portfolio_data)
 
         if not display_df.empty:
-            styled_df = display_df.style.format({
+            self._render_allocation(display_df)
+
+            st.subheader("📋 Holdings")
+            fcol1, fcol2, fcol3 = st.columns([1, 1, 2])
+            with fcol1:
+                status_filter = st.selectbox(
+                    "Show", ["All", "Below Supertrend", "Above Supertrend", "No price data",
+                             "Losing", "Gaining", "Beating index", "Overbought (RSI>70)", "Oversold (RSI<30)"],
+                    label_visibility="collapsed"
+                )
+            with fcol2:
+                show_indicators = st.toggle("Indicator columns", value=False,
+                                            help="RSI, distance from 52-week high, 1Y return vs index")
+            filtered = display_df
+            if status_filter == "Below Supertrend":
+                filtered = display_df[display_df['Status'].str.contains("Below", na=False)]
+            elif status_filter == "Above Supertrend":
+                filtered = display_df[display_df['Status'].str.contains("Above", na=False)]
+            elif status_filter == "No price data":
+                filtered = display_df[display_df['Status'].str.contains("No Price", na=False)]
+            elif status_filter == "Losing":
+                filtered = display_df[display_df['P/L'] < 0]
+            elif status_filter == "Gaining":
+                filtered = display_df[display_df['P/L'] > 0]
+            elif status_filter == "Beating index":
+                filtered = display_df[display_df['1Y vs Index %'] > 0]
+            elif status_filter == "Overbought (RSI>70)":
+                filtered = display_df[display_df['RSI'] > 70]
+            elif status_filter == "Oversold (RSI<30)":
+                filtered = display_df[display_df['RSI'] < 30]
+            with fcol3:
+                st.caption(f"{len(filtered)} of {len(display_df)} holdings · click a column header to sort")
+
+            indicator_cols = ['RSI', 'From 52w High %', '1Y vs Index %']
+            table = filtered if show_indicators else filtered.drop(columns=indicator_cols)
+
+            styled_df = table.style.format({
+                'Qty': '{:,.0f}',
                 'Avg. Price': '₹{:,.2f}',
                 'Current Price': '₹{:,.2f}',
-                'Day Change': '{:,.2f}',
+                'Day Change': '{:+,.2f}',
                 'Current Value': '₹{:,.2f}',
+                'Weight %': '{:.1f}%',
                 'P/L': '₹{:,.2f}',
-                'P/L %': '{:.2f}%'
-            }).apply(self._color_pnl_columns, subset=['Day Change', 'P/L', 'P/L %'])
-            st.dataframe(styled_df, use_container_width=True)
+                'P/L %': '{:+.2f}%',
+                'RSI': '{:.0f}',
+                'From 52w High %': '{:+.1f}%',
+                '1Y vs Index %': '{:+.1f}%',
+            }, na_rep='—').apply(
+                self._color_pnl_columns,
+                subset=[c for c in ['Day Change', 'P/L', 'P/L %', '1Y vs Index %'] if c in table.columns]
+            )
+            st.dataframe(styled_df, width="stretch")
+            self._render_export(filtered, "holdings")
+
+        st.header("📈 Chart a holding")
+        priced = [s for s in portfolio_data if s.get('current_price')]
+        if priced:
+            options = {f"{s['symbol']} — {s.get('company_name', '')}": s for s in priced}
+            pick = st.selectbox("Holding", list(options.keys()), label_visibility="collapsed", key="chart_pick")
+            self._render_price_chart(options[pick], key_suffix="_main")
 
         st.header("🔍 Individual Holdings Analysis")
         self._render_individual_stock_cards(portfolio_data)
@@ -231,18 +443,21 @@ Starting from row 23 (configurable)
 
                 status = stock.get('status')
                 if status == "Below Supertrend":
-                    supertrend = stock.get('supertrend', 0)
+                    supertrend = stock.get('supertrend') or 0
                     if supertrend > 0:
                         pct_below = ((supertrend - current_price) / supertrend) * 100
                         st.warning(f"⚠️ Below Supertrend ({pct_below:.1f}%)")
                 elif status == "Above Supertrend":
                     st.success("✅ Above Supertrend")
+
+                st.markdown(self._indicator_badges(stock))
             else:
                 st.error("❌ Price data unavailable")
                 error_msg = stock.get('tech_error', 'Unknown error')
                 st.caption(f"Error: {error_msg}")
 
-            with st.expander("ℹ️ More Details"):
+            with st.expander("📈 Chart & details"):
+                self._render_price_chart(stock)
                 about = stock.get('about', 'N/A')
                 if about and about != 'N/A':
                     st.info(f"**About:** {about}")
@@ -251,6 +466,139 @@ Starting from row 23 (configurable)
                     st.metric("ROE", stock.get('roe', 'N/A'))
                 with col2:
                     st.metric("ROCE", stock.get('roce', 'N/A'))
+
+    @staticmethod
+    def _indicator_badges(stock: Dict[str, Any]) -> str:
+        """Compact RSI / DMA / 52w-high / vs-index line for a card."""
+        parts = []
+        rsi = stock.get('rsi')
+        if rsi is not None:
+            tag = " 🔥" if rsi > 70 else (" 🧊" if rsi < 30 else "")
+            parts.append(f"RSI **{rsi:.0f}**{tag}")
+        price = stock.get('current_price') or 0
+        dma50, dma200 = stock.get('dma50'), stock.get('dma200')
+        if dma50 and dma200:
+            above = (price > dma50) + (price > dma200)
+            parts.append(f"DMA {'▲▲' if above == 2 else '▲▽' if above == 1 else '▽▽'} 50/200")
+        off_high = stock.get('pct_from_52w_high')
+        if off_high is not None:
+            parts.append(f"52w-high **{off_high:+.0f}%**")
+        vs = stock.get('vs_benchmark_1y')
+        if vs is not None:
+            parts.append(f"vs index **{vs:+.0f}pp**")
+        return " · ".join(parts) if parts else ""
+
+    def _render_price_chart(self, stock: Dict[str, Any], key_suffix: str = ""):
+        symbol = stock.get('api_symbol') or stock['symbol'].split('-')[0]
+        batch = st.session_state.get('price_batch_symbols')
+        history = self.data_sources.yfinance.get_history(symbol, batch)
+        if history is None or history.empty:
+            st.caption("No price history available for a chart.")
+            return
+        st_series = calculate_supertrend_series(
+            history,
+            length=self.config.get('technical_indicators.supertrend_length', 10),
+            multiplier=self.config.get('technical_indicators.supertrend_multiplier', 7.0),
+        )
+        months = st.segmented_control("Range", [3, 6, 12], default=12,
+                                      format_func=lambda m: f"{m}m",
+                                      key=f"range_{stock['symbol']}{key_suffix}",
+                                      label_visibility="collapsed") or 12
+        chart = charts.price_supertrend_chart(history, st_series, symbol,
+                                              avg_price=stock.get('avg_price') or None,
+                                              months=months)
+        if chart is not None:
+            st.altair_chart(chart, width="stretch")
+
+    # ---------------------------------------------------------------- watchlist
+
+    @ErrorBoundary.handle_errors(error_message="Error rendering watchlist tab", show_details=True)
+    def _render_watchlist_tab(self):
+        st.header("👁️ Watchlist")
+        st.caption("Stocks you're tracking but don't hold. Saved in dashboard_config.json. "
+                   "Screener results can be added from the Results tab.")
+
+        watchlist = self._watchlist()
+
+        col1, col2, col3 = st.columns([3, 1, 1])
+        with col1:
+            new_syms = st.text_input("Add symbols", placeholder="INFY, TCS, RELIANCE",
+                                     label_visibility="collapsed", key="wl_add_input")
+        with col2:
+            if st.button("➕ Add", width="stretch", key="wl_add_btn") and new_syms:
+                added = [s for s in new_syms.replace(';', ',').split(',') if s.strip()]
+                self._save_watchlist(watchlist + added)
+                st.rerun()
+        with col3:
+            if st.button("🔄 Refresh", type="primary", width="stretch", key="wl_refresh",
+                         disabled=not watchlist):
+                with st.spinner("Analyzing watchlist..."):
+                    data = safe_execute(
+                        lambda: self.portfolio_manager.process_symbols(watchlist, "Analyzing watchlist"),
+                        error_message="Watchlist refresh failed", default_return=[])
+                    st.session_state.watchlist_data = data
+                    st.session_state.watchlist_saved_at = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+                st.rerun()
+
+        if not watchlist:
+            st.info("Your watchlist is empty. Add symbols above or send screener results here.")
+            return
+
+        # Chips with remove buttons
+        held = self._held_symbols()
+        chip_cols = st.columns(min(6, len(watchlist)) or 1)
+        for i, sym in enumerate(watchlist):
+            with chip_cols[i % len(chip_cols)]:
+                label = f"✕ {sym}" + (" (held)" if sym in held else "")
+                if st.button(label, key=f"wl_rm_{sym}", help=f"Remove {sym}", width="stretch"):
+                    self._save_watchlist([s for s in watchlist if s != sym])
+                    st.session_state.watchlist_data = [
+                        d for d in st.session_state.get('watchlist_data', []) if d['symbol'] != sym]
+                    st.rerun()
+
+        data = st.session_state.get('watchlist_data') or []
+        if not data:
+            st.caption("Click **Refresh** to fetch prices, Supertrend and fundamentals.")
+            return
+
+        saved_at = st.session_state.get('watchlist_saved_at')
+        if saved_at:
+            st.caption(f"🕒 As of {saved_at}")
+
+        rows = []
+        for s in data:
+            rows.append({
+                'Symbol': s['symbol'],
+                'Company': s.get('company_name', s['symbol']),
+                'Industry': s.get('industry', 'N/A'),
+                'Price': s.get('current_price'),
+                'Day Change': s.get('day_change'),
+                'RSI': s.get('rsi'),
+                'From 52w High %': s.get('pct_from_52w_high'),
+                '1Y vs Index %': s.get('vs_benchmark_1y'),
+                'ROE': s.get('roe', 'N/A'),
+                'ROCE': s.get('roce', 'N/A'),
+                'Status': self.portfolio_manager._create_status_display(pd.Series(s)),
+                'Held': '✅' if s['symbol'] in held else '',
+            })
+        wl_df = pd.DataFrame(rows).set_index('Symbol')
+        for c in ['Price', 'Day Change', 'RSI', 'From 52w High %', '1Y vs Index %']:
+            wl_df[c] = pd.to_numeric(wl_df[c], errors='coerce')
+        styled = wl_df.style.format({
+            'Price': '₹{:,.2f}', 'Day Change': '{:+,.2f}', 'RSI': '{:.0f}',
+            'From 52w High %': '{:+.1f}%', '1Y vs Index %': '{:+.1f}%',
+        }, na_rep='—').apply(self._color_pnl_columns, subset=['Day Change', '1Y vs Index %'])
+        st.dataframe(styled, width="stretch")
+        self._render_export(wl_df, "watchlist")
+
+        st.subheader("📈 Charts")
+        for stock in data:
+            with st.expander(f"{stock['symbol']} — {stock.get('company_name', '')}"):
+                if stock.get('current_price'):
+                    st.markdown(self._indicator_badges(stock))
+                self._render_price_chart(stock)
+
+    # --------------------------------------------------------------------- news
 
     @ErrorBoundary.handle_errors(error_message="Error rendering news tab", show_details=True)
     def _render_news_tab(self):
@@ -262,28 +610,31 @@ Starting from row 23 (configurable)
             st.warning("Please refresh your portfolio data first to get personalized news")
             return
 
-        col1, col2 = st.columns([1, 3])
+        col1, col2, col3 = st.columns([1, 2, 2])
         with col1:
             fetch_news = st.button("📰 Fetch Latest News", type="primary",
-                                   help="Get latest financial news with sentiment analysis")
+                                   help="Market headlines plus a targeted search per holding")
         with col2:
+            per_holding = st.toggle("Search each holding", value=True,
+                                    help=f"One Google News search per holding ({len(portfolio_data)} extra "
+                                         "requests, cached 30 min). Off = market headlines only.")
+        with col3:
             if 'news_articles' in st.session_state:
-                last_update = st.session_state.get('news_last_updated', 'Unknown')
-                st.info(f"Last updated: {last_update}")
+                st.caption(f"🕒 Last updated: {st.session_state.get('news_last_updated', 'Unknown')}")
 
         if fetch_news:
-            self._fetch_and_display_news(portfolio_data)
+            self._fetch_news(portfolio_data, per_holding)
 
         if 'news_articles' in st.session_state:
             self._display_news_articles(st.session_state.news_articles)
 
-    def _fetch_and_display_news(self, portfolio_data: List[Dict[str, Any]]):
+    def _fetch_news(self, portfolio_data: List[Dict[str, Any]], per_holding: bool):
         def fetch_operation():
             portfolio_stocks = [
                 {'symbol': stock['symbol'], 'company_name': stock.get('company_name', stock['symbol'])}
                 for stock in portfolio_data
             ]
-            articles = self.data_sources.news.get_news_from_rss(portfolio_stocks)
+            articles = self.data_sources.news.get_news_from_rss(portfolio_stocks, include_holdings=per_holding)
             st.session_state.news_articles = articles
             st.session_state.news_last_updated = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
             return len(articles)
@@ -291,8 +642,7 @@ Starting from row 23 (configurable)
         with st.spinner("🔍 Fetching and analyzing news..."):
             num_articles = safe_execute(fetch_operation, error_message="Failed to fetch news", default_return=0)
             if num_articles > 0:
-                st.success(f"✅ Found {num_articles} relevant articles")
-                self._display_news_articles(st.session_state.news_articles)
+                st.toast(f"Found {num_articles} articles")
 
     def _display_news_articles(self, articles: List[Dict[str, Any]]):
         if not articles:
@@ -304,34 +654,66 @@ Starting from row 23 (configurable)
             sentiment = article.get('sentiment', 'Neutral')
             sentiment_counts[sentiment] = sentiment_counts.get(sentiment, 0) + 1
 
+        tagged = [a for a in articles if a.get('affected')]
+        neg_tagged = [a for a in tagged if a.get('sentiment') == 'Negative']
+
         st.subheader("📊 Sentiment Overview")
-        col1, col2, col3 = st.columns(3)
+        col1, col2, col3, col4 = st.columns(4)
         with col1:
             st.metric("🟢 Positive", sentiment_counts.get('Positive', 0))
         with col2:
             st.metric("⚪ Neutral", sentiment_counts.get('Neutral', 0))
         with col3:
             st.metric("🔴 Negative", sentiment_counts.get('Negative', 0))
+        with col4:
+            st.metric("🎯 About my holdings", len(tagged),
+                      delta=f"{len(neg_tagged)} negative" if neg_tagged else None, delta_color="inverse")
 
-        st.subheader("📖 Articles")
-        for article in articles:
+        # Filters
+        symbols = sorted({s for a in articles for s in a.get('affected', [])})
+        f1, f2, f3 = st.columns([1, 1, 2])
+        with f1:
+            sent_filter = st.selectbox("Sentiment", ["All", "Positive", "Negative", "Neutral"],
+                                       label_visibility="collapsed", key="news_sent")
+        with f2:
+            scope = st.selectbox("Scope", ["All articles", "My holdings only"] + symbols,
+                                 label_visibility="collapsed", key="news_scope")
+        with f3:
+            order = st.radio("Order", ["Newest", "Most negative", "Most positive"], horizontal=True,
+                             label_visibility="collapsed", key="news_order")
+
+        shown = articles
+        if sent_filter != "All":
+            shown = [a for a in shown if a.get('sentiment') == sent_filter]
+        if scope == "My holdings only":
+            shown = [a for a in shown if a.get('affected')]
+        elif scope not in ("All articles",):
+            shown = [a for a in shown if scope in a.get('affected', [])]
+        if order == "Most negative":
+            shown = sorted(shown, key=lambda a: a.get('score', 0))
+        elif order == "Most positive":
+            shown = sorted(shown, key=lambda a: -a.get('score', 0))
+
+        st.subheader(f"📖 Articles ({len(shown)})")
+        for article in shown:
             sentiment = article.get('sentiment', 'Neutral')
             icon = {"Positive": "🟢", "Negative": "🔴", "Neutral": "⚪"}.get(sentiment, "⚪")
 
             with st.container(border=True):
                 headline = article.get('headline', 'No title')
                 link = article.get('link', '#')
-                st.markdown(f"### {icon} [{headline}]({link})", unsafe_allow_html=True)
+                st.markdown(f"#### {icon} [{headline}]({link})")
 
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.caption(f"📰 Source: {article.get('source', 'Unknown')}")
-                with col2:
-                    st.caption(f"🕒 Published: {article.get('published', 'Unknown')}")
-
+                when = article.get('published_at')
+                try:
+                    when_text = pd.Timestamp(when).tz_convert('Asia/Kolkata').strftime('%d %b %Y, %H:%M') if when else article.get('published', 'Unknown')
+                except Exception:
+                    when_text = article.get('published', 'Unknown')
+                bits = [f"📰 {article.get('source', 'Unknown')}", f"🕒 {when_text}"]
                 affected = article.get('affected', [])
                 if affected:
-                    st.markdown(f"**🎯 Relevant to:** `{'`, `'.join(affected)}`")
+                    bits.append("🎯 " + ", ".join(f"`{s}`" for s in affected))
+                st.caption(" · ".join(bits))
 
     @ErrorBoundary.handle_errors(error_message="Error rendering screener tab", show_details=True)
     def _render_screener_tab(self):
@@ -459,7 +841,11 @@ Starting from row 23 (configurable)
             st.info("No scan results available. Run a scan to see results here.")
             return
 
-        results_df = st.session_state.scan_results
+        results_df = st.session_state.scan_results.copy()
+        # Mark what you already hold / watch so a scan result isn't a "new idea" by mistake
+        held, watched = self._held_symbols(), set(self._watchlist())
+        results_df.insert(1, 'Held', results_df['Symbol'].map(
+            lambda s: '💼 held' if s in held else ('👁️ watching' if s in watched else '')))
         preset_name = st.session_state.get('scan_preset_name', 'Custom')
         scan_clause = st.session_state.get('scan_clause_used', '')
         last_updated = st.session_state.get('scan_last_updated', 'Unknown')
@@ -542,7 +928,7 @@ Starting from row 23 (configurable)
             'Market Cap': '{}'
         }).apply(highlight_top_performers)
 
-        st.dataframe(styled_results, use_container_width=True, height=400)
+        st.dataframe(styled_results, width="stretch", height=400)
 
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -586,9 +972,12 @@ Starting from row 23 (configurable)
                 mime="text/csv"
             )
         with col2:
-            if st.button("👁️ Create Watchlist"):
-                st.session_state.watchlist = filtered_df['Symbol'].tolist()
-                st.success(f"Created watchlist with {len(st.session_state.watchlist)} stocks")
+            new_syms = [s for s in filtered_df['Symbol'].tolist() if s not in held]
+            if st.button(f"👁️ Add {len(new_syms)} to Watchlist", disabled=not new_syms,
+                         help="Adds every filtered result you don't already hold"):
+                self._save_watchlist(self._watchlist() + new_syms)
+                st.toast(f"Added {len(new_syms)} symbols — see the Watchlist tab")
+                st.rerun()
         with col3:
             if st.button("💾 Save as Preset"):
                 st.info("Feature coming soon: Save complex scans as presets")
@@ -632,6 +1021,10 @@ Starting from row 23 (configurable)
                                           self.config.get('rate_limits.max_retries', 3))
             timeout = st.number_input("Request Timeout (seconds)", 5, 60,
                                       self.config.get('rate_limits.timeout', 10))
+            workers = st.slider("Parallel fetch workers", 1, 8,
+                                int(self.config.get('rate_limits.parallel_workers', 4)),
+                                help="Screener.in scrapes run concurrently; the per-service "
+                                     "delay above still applies across all workers.")
 
         st.subheader("📈 Technical Indicators")
         col1, col2 = st.columns(2)
@@ -643,11 +1036,24 @@ Starting from row 23 (configurable)
                                             self.config.get('technical_indicators.supertrend_multiplier', 7.0),
                                             step=0.5)
 
+        st.subheader("📐 Portfolio")
+        col1, col2 = st.columns(2)
+        with col1:
+            benchmark = st.text_input("Benchmark symbol (NSE)",
+                                      value=self.config.get('benchmark.symbol', 'NIFTYBEES'),
+                                      help="1-year return of each holding is compared to this")
+        with col2:
+            concentration = st.number_input("Concentration alert (% of value)", 5, 50,
+                                            int(self.config.get('portfolio.concentration_threshold', 15)))
+
         if st.button("💾 Save Settings", type="primary"):
+            self.config.set('benchmark.symbol', benchmark.strip().upper() or 'NIFTYBEES')
+            self.config.set('portfolio.concentration_threshold', int(concentration))
             self.config.set('rate_limits.yfinance_delay', yf_delay)
             self.config.set('rate_limits.screener_delay', screener_delay)
             self.config.set('rate_limits.max_retries', int(max_retries))
             self.config.set('rate_limits.timeout', int(timeout))
+            self.config.set('rate_limits.parallel_workers', int(workers))
             self.config.set('technical_indicators.supertrend_length', int(st_length))
             self.config.set('technical_indicators.supertrend_multiplier', float(st_multiplier))
             st.success("✅ Settings saved successfully!")
@@ -676,10 +1082,14 @@ Starting from row 23 (configurable)
             st.json(self.config.config)
 
         st.subheader("🗑️ Cache Management")
-        col1, col2, col3 = st.columns(3)
+        st.caption("Prices are cached 15 min, fundamentals 24 h, scans and news 15–30 min. "
+                   "Clear the data cache to force a fresh fetch from every source.")
+        col1, col2, col3, col4 = st.columns(4)
         with col1:
             if st.button("Clear Portfolio Cache"):
                 st.session_state.portfolio_data = []
+                st.session_state.pop('portfolio_saved_at', None)
+                PortfolioStore.clear()
                 st.success("Portfolio cache cleared")
         with col2:
             if st.button("Clear News Cache"):
@@ -691,6 +1101,11 @@ Starting from row 23 (configurable)
                 if 'scan_results' in st.session_state:
                     del st.session_state.scan_results
                 st.success("Scan cache cleared")
+        with col4:
+            if st.button("Clear Data Cache", type="primary",
+                         help="Drop cached yfinance / Screener.in / Chartink / RSS responses"):
+                st.cache_data.clear()
+                st.success("Data cache cleared — next refresh will re-fetch everything")
 
 
 def main():

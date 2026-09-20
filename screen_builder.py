@@ -1,6 +1,7 @@
-# screener_builder.py
+# screen_builder.py
 import streamlit as st
 import json
+import uuid
 from typing import Dict, List, Any, Optional
 from dataclasses import dataclass, asdict
 from enum import Enum
@@ -99,18 +100,30 @@ class ScreenerBuilder:
         for name, data in preset_data.items():
             criteria = [ScreenerCriteria(**c) for c in data.get('criteria', [])]
             presets[name] = ScreenerPreset(
-                name=data['name'],
-                description=data['description'],
+                name=data.get('name', name),
+                description=data.get('description', ''),
                 criteria=criteria,
                 logic=data.get('logic', 'AND')
             )
- 
-        # Add default presets if none exist
+
+        # Seed defaults on a fresh install only. Deleted presets stay deleted;
+        # the user can bring defaults back with "Restore default presets".
         if not presets:
             presets = self._create_default_presets()
             self._save_presets(presets)
- 
+
         return presets
+
+    def restore_default_presets(self) -> int:
+        """Add any default preset that is missing. Returns how many were added."""
+        added = 0
+        for key, preset in self._create_default_presets().items():
+            if key not in self.presets:
+                self.presets[key] = preset
+                added += 1
+        if added:
+            self._save_presets(self.presets)
+        return added
  
     def _create_default_presets(self) -> Dict[str, ScreenerPreset]:
         """Create default screening presets"""
@@ -181,121 +194,151 @@ class ScreenerBuilder:
         self.config.set('screener_presets', preset_data)
  
     def render_screener_builder_ui(self) -> Optional[str]:
-        """Render the screener builder UI and return scan clause"""
-        st.header("ðŸ”§ Custom Stock Screener")
- 
+        """
+        Render the screener builder UI and return scan clause when "Run Scan" is pressed.
+
+        Every edit (toggle, logic, add, delete) is persisted immediately. The app
+        object is rebuilt on each Streamlit rerun, so anything held only in memory
+        would be lost before the next click.
+        """
+        st.header("🔧 Custom Stock Screener")
+
         # Preset selection
-        col1, col2 = st.columns([2, 1])
- 
+        col1, col2, col3 = st.columns([2, 1, 1])
+
         with col1:
             preset_names = list(self.presets.keys())
             if not preset_names:
                 st.error("No presets available")
+                if st.button("♻️ Restore default presets"):
+                    self.restore_default_presets()
+                    st.rerun()
                 return None
- 
+
             selected_preset_name = st.selectbox(
-                "ðŸ“‹ Select Preset",
+                "📋 Select Preset",
                 preset_names,
+                format_func=lambda k: self.presets[k].name,
                 help="Choose a pre-built screening strategy or customize your own"
             )
- 
+
         with col2:
-            if st.button("âž• New Preset"):
+            st.write("")  # align with selectbox
+            if st.button("➕ New Preset", width="stretch"):
                 self._show_new_preset_dialog()
- 
+
+        with col3:
+            st.write("")
+            if st.button("♻️ Restore defaults", width="stretch",
+                         help="Re-add any built-in preset you deleted"):
+                added = self.restore_default_presets()
+                st.toast(f"Restored {added} preset(s)" if added else "All defaults already present")
+                if added:
+                    st.rerun()
+
         if selected_preset_name not in self.presets:
             return None
- 
+
         selected_preset = self.presets[selected_preset_name]
- 
+        key_prefix = f"preset_{selected_preset_name}"   # keep widget state per-preset
+
         # Display preset info
         st.info(f"**{selected_preset.name}**: {selected_preset.description}")
- 
-        # Logic selection
+
+        # Logic selection — persisted on change
         col1, col2 = st.columns([1, 3])
         with col1:
             logic = st.radio(
-                "ðŸ”— Combine criteria with:",
+                "🔗 Combine criteria with:",
                 ["AND", "OR"],
                 index=0 if selected_preset.logic == "AND" else 1,
+                key=f"{key_prefix}_logic",
                 help="AND = All conditions must be true, OR = Any condition can be true"
             )
-            selected_preset.logic = logic
- 
+            if logic != selected_preset.logic:
+                selected_preset.logic = logic
+                self._save_presets(self.presets)
+
         # Criteria management
-        st.subheader("ðŸ“Š Screening Criteria")
- 
-        # Show existing criteria
+        st.subheader("📊 Screening Criteria")
+
+        if not selected_preset.criteria:
+            st.caption("No criteria yet — add one below.")
+
         criteria_to_remove = []
+        changed = False
         for i, criteria in enumerate(selected_preset.criteria):
             with st.container(border=True):
                 col1, col2, col3, col4 = st.columns([1, 3, 3, 1])
- 
+
                 with col1:
-                    criteria.enabled = st.checkbox(
-                        "âœ“",
+                    enabled = st.checkbox(
+                        "✓",
                         value=criteria.enabled,
-                        key=f"enable_{criteria.id}",
+                        key=f"{key_prefix}_enable_{criteria.id}",
                         help="Enable/disable this criteria"
                     )
- 
+                    if enabled != criteria.enabled:
+                        criteria.enabled = enabled
+                        changed = True
+
                 with col2:
                     st.text_input(
                         "Name",
                         value=criteria.name,
-                        key=f"name_{criteria.id}",
+                        key=f"{key_prefix}_name_{criteria.id}",
                         disabled=True
                     )
- 
+
                 with col3:
-                    clause = f"{criteria.left_operand} {criteria.operator} {criteria.right_operand}"
-                    st.code(clause, language=None)
- 
+                    st.code(criteria.to_chartink_clause().strip("() "), language=None)
+
                 with col4:
-                    if st.button("ðŸ—‘ï¸", key=f"delete_{criteria.id}", help="Delete criteria"):
+                    if st.button("🗑️", key=f"{key_prefix}_delete_{criteria.id}", help="Delete criteria"):
                         criteria_to_remove.append(i)
- 
-        # Remove deleted criteria
-        for i in reversed(criteria_to_remove):
-            selected_preset.criteria.pop(i)
- 
+
+        if criteria_to_remove:
+            for i in reversed(criteria_to_remove):
+                selected_preset.criteria.pop(i)
+            self._save_presets(self.presets)
+            st.rerun()
+
+        if changed:
+            self._save_presets(self.presets)
+
         # Add new criteria
-        with st.expander("âž• Add New Criteria", expanded=False):
+        with st.expander("➕ Add New Criteria", expanded=False):
             self._render_add_criteria_form(selected_preset)
- 
+
         # Advanced options
-        with st.expander("ðŸ”§ Advanced Options", expanded=False):
+        with st.expander("🔧 Advanced Options", expanded=False):
             self._render_advanced_options()
- 
+
         # Generate and display scan clause
         scan_clause = selected_preset.to_chartink_scan()
- 
+
         if scan_clause:
-            st.subheader("ðŸ” Generated Scan Clause")
+            st.subheader("🔍 Generated Scan Clause")
             st.code(scan_clause, language=None)
- 
-            # Save changes
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                if st.button("ðŸ’¾ Save Preset", type="secondary"):
-                    self.presets[selected_preset_name] = selected_preset
+        else:
+            st.warning("Enable or add at least one criterion to generate a scan.")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🚀 Run Scan", type="primary", width="stretch",
+                         disabled=not scan_clause):
+                return scan_clause
+
+        with col2:
+            if st.button("🗑️ Delete Preset", type="secondary", width="stretch"):
+                if len(self.presets) > 1:  # Don't delete last preset
+                    del self.presets[selected_preset_name]
                     self._save_presets(self.presets)
-                    st.success("Preset saved!")
- 
-            with col2:
-                if st.button("ðŸš€ Run Scan", type="primary"):
-                    return scan_clause
- 
-            with col3:
-                if st.button("ðŸ—‘ï¸ Delete Preset", type="secondary"):
-                    if len(self.presets) > 1:  # Don't delete last preset
-                        del self.presets[selected_preset_name]
-                        self._save_presets(self.presets)
-                        st.success("Preset deleted!")
-                        st.rerun()
-                    else:
-                        st.error("Cannot delete the last preset")
- 
+                    st.toast("Preset deleted")
+                    st.rerun()
+                else:
+                    st.error("Cannot delete the last preset")
+
         return None
  
     def _render_add_criteria_form(self, preset: ScreenerPreset):
@@ -381,21 +424,22 @@ class ScreenerBuilder:
             if st.form_submit_button("Add Criteria"):
                 if criteria_name and left_operand and right_operand:
                     new_criteria = ScreenerCriteria(
-                        id=f"custom_{len(preset.criteria)}",
+                        id=f"c_{uuid.uuid4().hex[:8]}",   # never collides after deletes
                         name=criteria_name,
                         left_operand=left_operand,
                         operator=operator,
                         right_operand=right_operand
                     )
                     preset.criteria.append(new_criteria)
-                    st.success(f"Added criteria: {criteria_name}")
+                    self._save_presets(self.presets)
+                    st.toast(f"Added criteria: {criteria_name}")
                     st.rerun()
                 else:
                     st.error("Please fill all fields")
  
     def _render_advanced_options(self):
         """Render advanced screening options"""
-        st.markdown("**ðŸŽ¯ Quick Filters**")
+        st.markdown("**🎯 Quick Filters**")
  
         col1, col2 = st.columns(2)
  
@@ -407,7 +451,7 @@ class ScreenerBuilder:
             if st.button("Add Sector Filter"):
                 st.info("Sector filtering coming soon!")
  
-        st.markdown("**ðŸ“– Chartink Documentation**")
+        st.markdown("**📖 Chartink Documentation**")
         st.markdown("""
         **Common Chartink Expressions:**
         - `daily close > daily ema( 20 )` - Price above 20-day EMA
@@ -419,28 +463,37 @@ class ScreenerBuilder:
         """)
  
     def _show_new_preset_dialog(self):
-        """Show dialog to create new preset"""
-        with st.form("new_preset"):
-            st.subheader("Create New Preset")
- 
+        """
+        Open a modal to create a new preset.
+
+        Must be a dialog: a form rendered inline under `if st.button(...)` only
+        exists on the run where the button was clicked, so its submit could never
+        be processed.
+        """
+        builder = self
+
+        @st.dialog("Create New Preset")
+        def dialog():
             preset_name = st.text_input("Preset Name", placeholder="My Custom Strategy")
             preset_desc = st.text_area("Description", placeholder="Description of this screening strategy")
- 
-            if st.form_submit_button("Create Preset"):
-                if preset_name and preset_name not in self.presets:
-                    new_preset = ScreenerPreset(
-                        name=preset_name,
-                        description=preset_desc,
-                        criteria=[]
-                    )
-                    self.presets[preset_name] = new_preset
-                    self._save_presets(self.presets)
-                    st.success(f"Created preset: {preset_name}")
-                    st.rerun()
-                elif preset_name in self.presets:
+
+            if st.button("Create Preset", type="primary"):
+                key = preset_name.strip().lower().replace(" ", "_")
+                if not key:
+                    st.error("Please enter a preset name")
+                elif key in builder.presets:
                     st.error("Preset name already exists")
                 else:
-                    st.error("Please enter a preset name")
+                    builder.presets[key] = ScreenerPreset(
+                        name=preset_name.strip(),
+                        description=preset_desc.strip(),
+                        criteria=[]
+                    )
+                    builder._save_presets(builder.presets)
+                    st.toast(f"Created preset: {preset_name}")
+                    st.rerun()
+
+        dialog()
  
     def get_preset_names(self) -> List[str]:
         """Get list of available preset names"""

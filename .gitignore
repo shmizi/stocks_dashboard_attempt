@@ -1,6 +1,23 @@
+# Virtual environments
 venv/
+.venv/
+
+# Python
 __pycache__/
 *.pyc
-.env
+
+# Editors
 .idea/
 .vscode/
+
+# Secrets & local env
+.env
+.streamlit/secrets.toml
+
+# Personal data — broker exports never belong in the repo
+*.xlsx
+*.xls
+*.csv
+
+# Persisted last-refresh portfolio snapshot
+.portfolio_cache.json

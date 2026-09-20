@@ -1,10 +1,5 @@
 {
   "etf_data": {
-    "GOLDBEES": {
-      "name": "Nippon India ETF Gold Bees",
-      "description": "This is an Exchange-Traded Fund that tracks the price of gold.",
-      "category": "Gold ETF"
-    },
     "NIFTYBEES": {
       "name": "Nippon India ETF Nifty BeES",
       "description": "ETF tracking the Nifty 50 index",
@@ -21,7 +16,8 @@
     "screener_delay": 1.0,
     "chartink_delay": 2.0,
     "max_retries": 3,
-    "timeout": 10
+    "timeout": 10,
+    "parallel_workers": 4
   },
   "data_sources": {
     "portfolio_file": "holdings-SOH330.xlsx",
@@ -40,5 +36,173 @@
     "min_market_cap": 500,
     "weekly_gain_threshold": 1.1,
     "max_results": 50
+  },
+  "benchmark": {
+    "symbol": "NIFTYBEES"
+  },
+  "portfolio": {
+    "concentration_threshold": 15
+  },
+  "watchlist": [
+    "INFY",
+    "TCS"
+  ],
+  "screener_presets": {
+    "weekly_breakout": {
+      "name": "Weekly Breakout",
+      "description": "Stocks up 10%+ from 1 week ago, above Supertrend, good market cap",
+      "logic": "AND",
+      "criteria": [
+        {
+          "id": "wb1",
+          "name": "Weekly Gain 10%+",
+          "left_operand": "daily close",
+          "operator": ">=",
+          "right_operand": "1 week ago close * 1.1",
+          "enabled": true
+        },
+        {
+          "id": "wb2",
+          "name": "Above Supertrend",
+          "left_operand": "daily close",
+          "operator": ">",
+          "right_operand": "daily supertrend( 10, 7 )",
+          "enabled": true
+        },
+        {
+          "id": "wb3",
+          "name": "Market Cap > 500Cr",
+          "left_operand": "market cap",
+          "operator": ">",
+          "right_operand": "500",
+          "enabled": true
+        }
+      ]
+    },
+    "momentum": {
+      "name": "Momentum Stocks",
+      "description": "High momentum stocks with strong volume and RSI",
+      "logic": "AND",
+      "criteria": [
+        {
+          "id": "mom1",
+          "name": "Price > 20 EMA",
+          "left_operand": "daily close",
+          "operator": ">",
+          "right_operand": "daily ema( 20 )",
+          "enabled": true
+        },
+        {
+          "id": "mom2",
+          "name": "Volume > 2x Avg",
+          "left_operand": "daily volume",
+          "operator": ">",
+          "right_operand": "daily sma( daily volume, 20 ) * 2",
+          "enabled": true
+        },
+        {
+          "id": "mom3",
+          "name": "RSI > 60",
+          "left_operand": "daily rsi( 14 )",
+          "operator": ">",
+          "right_operand": "60",
+          "enabled": true
+        },
+        {
+          "id": "mom4",
+          "name": "Market Cap > 100Cr",
+          "left_operand": "market cap",
+          "operator": ">",
+          "right_operand": "100",
+          "enabled": true
+        }
+      ]
+    },
+    "value": {
+      "name": "Value Picks",
+      "description": "Undervalued stocks with good fundamentals",
+      "logic": "AND",
+      "criteria": [
+        {
+          "id": "val1",
+          "name": "PE < 15",
+          "left_operand": "pe",
+          "operator": "<",
+          "right_operand": "15",
+          "enabled": true
+        },
+        {
+          "id": "val2",
+          "name": "ROE > 15%",
+          "left_operand": "roe",
+          "operator": ">",
+          "right_operand": "15",
+          "enabled": true
+        },
+        {
+          "id": "val3",
+          "name": "Debt to Equity < 0.5",
+          "left_operand": "debt to equity",
+          "operator": "<",
+          "right_operand": "0.5",
+          "enabled": true
+        },
+        {
+          "id": "val4",
+          "name": "Market Cap > 500Cr",
+          "left_operand": "market cap",
+          "operator": ">",
+          "right_operand": "500",
+          "enabled": true
+        }
+      ]
+    },
+    "consolidation_breakout": {
+      "name": "Consolidation Breakout",
+      "description": "Stocks breaking out from sideways consolidation",
+      "logic": "AND",
+      "criteria": [
+        {
+          "id": "cb1",
+          "name": "Close > 20 day high",
+          "left_operand": "daily close",
+          "operator": ">",
+          "right_operand": "daily max( 20, daily high )",
+          "enabled": true
+        },
+        {
+          "id": "cb2",
+          "name": "Volume > 1.5x avg",
+          "left_operand": "daily volume",
+          "operator": ">",
+          "right_operand": "daily sma( daily volume, 10 ) * 1.5",
+          "enabled": true
+        },
+        {
+          "id": "cb3",
+          "name": "RSI between 50-70",
+          "left_operand": "daily rsi( 14 )",
+          "operator": ">",
+          "right_operand": "50",
+          "enabled": true
+        },
+        {
+          "id": "cb4",
+          "name": "RSI upper limit",
+          "left_operand": "daily rsi( 14 )",
+          "operator": "<",
+          "right_operand": "70",
+          "enabled": true
+        },
+        {
+          "id": "cb5",
+          "name": "Market Cap > 200Cr",
+          "left_operand": "market cap",
+          "operator": ">",
+          "right_operand": "200",
+          "enabled": true
+        }
+      ]
+    }
   }
 }
