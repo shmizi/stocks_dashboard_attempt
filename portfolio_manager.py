@@ -3,6 +3,7 @@ import json
 import logging
 import math
 import os
+import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -454,11 +455,11 @@ class PortfolioManager:
 
         return out
 
+    _SERIES_SUFFIX = re.compile(r'-[A-Z]{1,2}$')   # NSE series: -EQ, -BE, -BZ, -SM, -ST, -F, -E …
+
     def _clean_symbol(self, symbol: str) -> str:
-        """Clean stock symbol for API usage"""
-        if symbol.endswith(('-E', '-EQ')):
-            return symbol.split('-')[0]
-        return symbol
+        """Strip the NSE series suffix broker exports append (LIQUIDCASE-F → LIQUIDCASE)."""
+        return self._SERIES_SUFFIX.sub('', symbol.strip().upper())
 
     def calculate_portfolio_summary(self, stocks_data: List[Dict[str, Any]]) -> Dict[str, float]:
         """Calculate portfolio summary metrics"""
@@ -508,11 +509,10 @@ class PortfolioManager:
         # Calculate display columns
         df['current_value'] = df['current_price'] * df['qty']
         df['pnl'] = (df['current_price'] - df['avg_price']) * df['qty']
-        df['pnl_percent'] = (
-            (df['current_price'] - df['avg_price']) / df['avg_price'].replace(0, pd.NA) * 100
-        ).astype(float).round(2)
+        safe_avg = df['avg_price'].where(df['avg_price'] > 0)          # 0 → NaN, no divide-by-zero
+        df['pnl_percent'] = ((df['current_price'] - df['avg_price']) / safe_avg * 100).round(2)
         # Unpriced rows would otherwise show a -100% loss
-        df.loc[df['current_price'] <= 0, ['pnl', 'pnl_percent']] = pd.NA
+        df.loc[df['current_price'] <= 0, ['pnl', 'pnl_percent']] = float('nan')
 
         # Create status column with better error messages
         df['status_display'] = df.apply(self._create_status_display, axis=1)
@@ -570,8 +570,9 @@ class ETFManager:
         self.config = config
 
     def show_etf_management_ui(self):
-        """Show ETF management interface in sidebar"""
-        with st.sidebar.expander("🔧 Manage ETFs", expanded=False):
+        """ETF list editor (rendered wherever it is called — Settings tab)"""
+        with st.expander("Manage ETFs", expanded=False):
+            st.caption("ETFs skip the Screener.in fundamentals scrape and use the category below as their industry.")
             st.subheader("Current ETFs")
 
             etf_data = self.config.get('etf_data', {})

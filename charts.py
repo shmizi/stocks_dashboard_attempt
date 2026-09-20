@@ -6,7 +6,7 @@
 #   * good / warning / critical       → status colours, always with a label
 # Chrome (axes, grid, text) is left to Streamlit's own Altair theme so charts
 # match whichever theme the app is rendered in.
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import altair as alt
 import pandas as pd
@@ -179,6 +179,49 @@ def price_supertrend_chart(history: pd.DataFrame, supertrend: Optional[pd.DataFr
     layers += [crosshair, points, selectors]
 
     return alt.layer(*layers).properties(height=280, title=f"{symbol} — 1 year").interactive(bind_y=False)
+
+
+# ---------------------------------------------------------------------------
+# Sector pulse
+# ---------------------------------------------------------------------------
+
+def sector_returns_chart(sectors: List[Dict], window: str = "1w",
+                         highlight: Optional[List[str]] = None) -> Optional[alt.Chart]:
+    """
+    Diverging bars of sector return over one window: blue above zero, red
+    below. Sectors you hold get a marker so the story "my sectors vs market"
+    reads without colour.
+    """
+    rows = [s for s in sectors if s.get(window) is not None]
+    if not rows:
+        return None
+    df = pd.DataFrame(rows).sort_values(window, ascending=False)
+    df['held'] = df['sector'].isin(highlight or [])
+    df['label'] = df.apply(lambda r: f"{r['sector']}{' ◆' if r['held'] else ''}", axis=1)
+    order = df['label'].tolist()
+    p = palette()
+
+    base = alt.Chart(df).encode(
+        y=alt.Y('label:N', sort=order, title=None, axis=alt.Axis(labelOverlap=False)),
+        x=alt.X(f'{window}:Q', title=f'{window} return (%)', axis=alt.Axis(format='+.1f')),
+        tooltip=[alt.Tooltip('sector:N', title='Sector'),
+                 alt.Tooltip('1d:Q', title='1 day', format='+.2f'),
+                 alt.Tooltip('1w:Q', title='1 week', format='+.2f'),
+                 alt.Tooltip('1m:Q', title='1 month', format='+.2f'),
+                 alt.Tooltip('3m:Q', title='3 months', format='+.2f')],
+    )
+    bars = base.mark_bar(cornerRadiusEnd=3, height={'band': 0.65}).encode(
+        color=alt.condition(alt.datum[window] >= 0, alt.value(p['series']), alt.value(p['critical']))
+    )
+    # Value labels sit just outside the bar end, on the correct side of zero
+    text = alt.Text(f'{window}:Q', format='+.1f')
+    pos_labels = base.mark_text(fontSize=11, color=p['muted'], align='left', dx=4) \
+        .encode(text=text).transform_filter(alt.datum[window] >= 0)
+    neg_labels = base.mark_text(fontSize=11, color=p['muted'], align='right', dx=-4) \
+        .encode(text=text).transform_filter(alt.datum[window] < 0)
+    zero = alt.Chart(pd.DataFrame({'x': [0]})).mark_rule(color=p['muted'], strokeWidth=1).encode(x='x:Q')
+
+    return (bars + pos_labels + neg_labels + zero).properties(height=max(160, 24 * len(df) + 20))
 
 
 # ---------------------------------------------------------------------------

@@ -21,3 +21,4 @@ __pycache__/
 
 # Persisted last-refresh portfolio snapshot
 .portfolio_cache.json
+.claude/

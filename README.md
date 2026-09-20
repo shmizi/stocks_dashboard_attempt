@@ -65,13 +65,23 @@ streamlit run main.py
 - Calculates P/L, day change, and portfolio-level totals
 - Supertrend (10, 7) signal for each holding — bullish/bearish status
 - ETF-aware: ETFs skip the Screener.in fundamentals scrape
-- AI-powered industry classification via Gemini API (optional)
+- Needs-attention strip: Supertrend flips since last refresh, concentration breaches, ±4% movers, RSI extremes
+- Allocation chart + per-industry breakdown side by side
+- Indicator columns: RSI, distance from 52-week high, 1-year return vs benchmark
+- Portfolio value logged per refresh-day and charted
+- Watchlist tab with the same analysis for stocks you don't hold; screener results can be sent there
+
+### 🌍 Market
+- Rule-based **risk regime** (calm / elevated / risk-off) with the reasons spelled out: Nifty vs 50/200-day averages, India VIX, crude, rupee, overnight US
+- Gauges: Nifty, Sensex, Midcap, India VIX, USD/INR, Brent, gold, S&P, Nasdaq, US VIX, US 10Y, dollar index
+- **What's moving the market**: targeted headline searches (FII flows, crude, geopolitics, RBI) — with a Gemini key, a written 3–5 bullet explanation
+- **Sector pulse**: 1d / 1w / 1m / 3m returns for 12 NSE sectors, with the sectors you hold marked
 
 ### 📰 News & Sentiment
-- Fetches Indian market news from Google News RSS
-- VADER sentiment analysis (Positive / Neutral / Negative)
-- Highlights articles mentioning your portfolio stocks
-- Sentiment summary dashboard
+- Market headlines plus one targeted Google News search per holding
+- VADER sentiment with a finance-specific lexicon overlay (crash/rally/downgrade/… — stock VADER thinks "Sensex crashes" is neutral)
+- **TL;DR** at the top: rule-based, or an AI summary if a Gemini key is set; full article list is collapsed
+- Filters by sentiment, holding, and ordering
 
 ### 🔍 Stock Screener (Chartink-powered)
 Three sub-tabs:
@@ -153,7 +163,8 @@ All calls use exponential backoff on failure. Tune delays in Settings if you hit
 ## 📝 Notes
 
 - Data is fetched on demand and cached in-process: prices 15 min, fundamentals 24 h, scans/news 15–30 min. Use Settings → Clear Data Cache to force a refresh.
-- The Gemini API key is read from `.streamlit/secrets.toml` if present, otherwise it is session-only.
+- The Gemini API key is optional and only powers the written summaries on the Market and News tabs. It is read from `.streamlit/secrets.toml` if present, otherwise it is session-only.
+- The Market tab **explains**, it does not predict. The risk score is a fixed rulebook over public gauges; treat it as a reading, not a signal.
 - `*.xlsx` files are git-ignored so your broker export never gets committed.
 - Screener.in scraping respects a 1s delay; heavy portfolio loads may take 1–2 minutes.
 - This app is for personal/educational use. Respect each data provider's terms of service.

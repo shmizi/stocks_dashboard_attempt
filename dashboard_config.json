@@ -9,6 +9,11 @@
       "name": "Nippon India ETF Bank BeES",
       "description": "ETF tracking the Nifty Bank index",
       "category": "Sector ETF"
+    },
+    "LIQUIDCASE": {
+      "name": "Zerodha Nifty 1D Rate Liquid ETF",
+      "description": "Liquid ETF parking cash at overnight rates; behaves like a money-market fund.",
+      "category": "Liquid ETF"
     }
   },
   "rate_limits": {
@@ -20,7 +25,7 @@
     "parallel_workers": 4
   },
   "data_sources": {
-    "portfolio_file": "holdings-SOH330.xlsx",
+    "portfolio_file": "uploaded_holdings.xlsx",
     "portfolio_start_row": 22,
     "portfolio_columns": "B:M"
   },

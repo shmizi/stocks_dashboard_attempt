@@ -626,10 +626,21 @@ FINANCE_LEXICON: Dict[str, float] = {
     'profit': 1.5, 'profits': 1.5, 'growth': 1.5, 'strong': 1.5, 'dividend': 1.5,
     'inflow': 1.5, 'inflows': 1.5, 'recovery': 1.5, 'recovers': 1.5, 'boost': 1.5, 'boosts': 1.5,
     'bull': 1.5, 'higher': 1.0, 'high': 1.0, 'green': 1.0, 'upbeat': 1.5,
+    # --- -ing forms (headlines love them: "Why is the market falling?") ---
+    'falling': -1.8, 'dropping': -1.8, 'declining': -1.8, 'sliding': -1.8, 'sinking': -2.0,
+    'slumping': -2.5, 'tumbling': -2.5, 'plunging': -3.0, 'crashing': -3.0, 'tanking': -2.5,
+    'dumping': -2.0, 'selling': -1.0, 'weakening': -1.5, 'losing': -1.5, 'cutting': -1.0,
+    'rising': 1.5, 'climbing': 1.5, 'gaining': 2.0, 'jumping': 2.0, 'rallying': 2.5,
+    'surging': 3.0, 'soaring': 3.0, 'rebounding': 2.0, 'recovering': 1.5, 'buying': 1.0,
+    'outperforming': 2.5, 'beating': 2.0, 'strengthening': 1.5,
     # --- finance nouns VADER reads emotionally ("share" = sharing, "trust", "gross") ---
     'share': 0.0, 'shares': 0.0, 'interest': 0.0, 'credit': 0.0, 'trust': 0.0,
     'security': 0.0, 'securities': 0.0, 'treasury': 0.0, 'value': 0.0, 'worth': 0.0,
     'gross': 0.0, 'asset': 0.0, 'assets': 0.0,
+    'nifty': 0.0,          # the index, not "neat"
+    # --- direction words VADER ignores ---
+    'down': -1.2, 'up': 1.2, 'lower': -1.0, 'below': -0.5, 'above': 0.5,
+    'red': -1.0, 'green': 1.0, 'flat': 0.0, 'record': 0.8, 'all-time': 0.5,
 }
 
 
@@ -778,6 +789,64 @@ class NewsProvider:
 
         return sorted(articles.values(), key=lambda a: a['published_at'] or '', reverse=True)
 
+    MARKET_DRIVER_QUERIES = [
+        'Sensex Nifty today',
+        'stock market fall reason India',
+        'FII selling India',
+        'crude oil price India rupee',
+        'Iran Israel US tensions markets',
+        'RBI rate decision',
+    ]
+
+    @ErrorBoundary.handle_errors(fallback_value=[], error_message="Failed to fetch market news")
+    def get_market_driver_news(self, per_query: int = 6) -> List[Dict]:
+        """Headlines that usually explain index-level moves. Newest first, de-duped."""
+        seen: Dict[str, Dict] = {}
+        for q in self.MARKET_DRIVER_QUERIES:
+            try:
+                entries = _fetch_rss_entries(_google_news_url(q), self.timeout)
+            except Exception as e:
+                logger.warning(f"Market news search failed ({q}): {e}")
+                continue
+            for entry in entries[:per_query]:
+                link = entry.get('link', '#')
+                if link in seen:
+                    continue
+                title = entry.get('title', '')
+                headline = self._SOURCE_SUFFIX.sub('', title).strip() or title
+                sentiment, score = self._get_sentiment(headline)
+                published_at = _parse_pub_date(entry.get('published', ''))
+                seen[link] = {
+                    'headline': headline, 'link': link, 'source': entry.get('source', 'N/A'),
+                    'published': entry.get('published', 'N/A'),
+                    'published_at': published_at.isoformat() if published_at else None,
+                    'sentiment': sentiment, 'score': score, 'query': q,
+                }
+        return sorted(seen.values(), key=lambda a: a['published_at'] or '', reverse=True)
+
+    @staticmethod
+    def rule_based_tldr(articles: List[Dict], holdings: List[str]) -> str:
+        """No-LLM summary: counts plus the negative items about holdings."""
+        if not articles:
+            return "No articles."
+        n = len(articles)
+        pos = sum(a.get('sentiment') == 'Positive' for a in articles)
+        neg = sum(a.get('sentiment') == 'Negative' for a in articles)
+        mood = "mostly positive" if pos > 2 * neg else "mostly negative" if neg > 2 * pos else "mixed"
+        tagged = [a for a in articles if a.get('affected')]
+        neg_tagged = sorted((a for a in tagged if a.get('sentiment') == 'Negative'),
+                            key=lambda a: a.get('score', 0))
+        lines = [f"**Market mood:** {mood} — {pos} positive / {neg} negative of {n} headlines.",
+                 f"**About my holdings:** {len(tagged)} headlines mention "
+                 f"{len({s for a in tagged for s in a['affected']})} of your stocks."]
+        if neg_tagged:
+            lines.append("**Worth a closer look:**")
+            for a in neg_tagged[:3]:
+                lines.append(f"- {', '.join(a['affected'])}: [{a['headline']}]({a['link']})")
+        else:
+            lines.append("No negative headlines about your holdings in this batch.")
+        return "\n".join(lines)
+
     def _get_sentiment(self, text: str) -> Tuple[str, float]:
         """Classify text; returns (label, compound score)."""
         analyzer = self._get_analyzer()
@@ -862,6 +931,85 @@ class AIProvider:
             max_retries=2
         )
 
+    # ---- generic text generation -----------------------------------------
+
+    def generate(self, prompt: str, api_key: str, max_tokens: int = 600) -> Optional[str]:
+        """One Gemini call → plain text, or None on any failure (never raises)."""
+        if not api_key or not prompt:
+            return None
+
+        def call():
+            url = ("https://generativelanguage.googleapis.com/v1beta/models/"
+                   f"{self.model}:generateContent")
+            payload = {
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.3},
+            }
+            response = requests.post(
+                url, headers={'Content-Type': 'application/json', 'x-goog-api-key': api_key},
+                json=payload, timeout=self.timeout)
+            if response.status_code in (400, 401, 403):
+                raise ValidationError(f"Gemini rejected the request ({response.status_code})")
+            response.raise_for_status()
+            result = response.json()
+            return result['candidates'][0]['content']['parts'][0]['text'].strip()
+
+        try:
+            return rate_limited_call(service="gemini_ai", func=call,
+                                     min_delay=2.0, calls_per_minute=15, max_retries=1)
+        except Exception as e:
+            logger.warning(f"Gemini generate failed: {e}")
+            return None
+
+    def summarize_market(self, snapshot: Dict[str, Any], headlines: List[Dict],
+                         api_key: str) -> Optional[str]:
+        """3–5 bullets: what moved the Indian market and why, grounded in the data given."""
+        macro = snapshot.get('macro', {})
+        gauges = "\n".join(
+            f"- {k}: {v['last']:,.2f} (1d {v.get('1d') or 0:+.2f}%, 1w {v.get('1w') or 0:+.2f}%, 1m {v.get('1m') or 0:+.2f}%)"
+            for k, v in macro.items())
+        sectors = ", ".join(f"{s['sector']} {s.get('1d') or 0:+.1f}%" for s in snapshot.get('sectors', []))
+        regime = snapshot.get('regime', {})
+        heads = "\n".join(f"- {h['headline']} ({h.get('source', '')})" for h in headlines[:25])
+        prompt = f"""You are a market analyst writing a short morning note for an Indian retail investor.
+Use ONLY the data below. Do not invent numbers. Do not give buy/sell advice or predictions.
+
+Market gauges (latest close):
+{gauges}
+
+Sector moves today: {sectors}
+
+Rule-based risk read: {regime.get('label')} (score {regime.get('score')}/10). Reasons: {'; '.join(regime.get('reasons') or ['none'])}
+
+Recent headlines:
+{heads}
+
+Write:
+1. One sentence: where the Indian market is today (direction and size of move).
+2. 3–5 bullets explaining WHY, linking specific headlines/geopolitics/macro to the gauges (e.g. crude, rupee, FII flows, global cues, US-Iran tensions if present in headlines).
+3. One bullet: what to watch next (an event or level), phrased neutrally.
+Plain text, markdown bullets, under 180 words."""
+        return self.generate(prompt, api_key, max_tokens=500)
+
+    def summarize_news(self, articles: List[Dict], holdings: List[str], api_key: str) -> Optional[str]:
+        """TL;DR of a headline batch, with a separate line for the user's holdings."""
+        heads = "\n".join(
+            f"- [{a.get('sentiment', 'Neutral')}] {a['headline']}"
+            + (f"  (about: {', '.join(a['affected'])})" if a.get('affected') else "")
+            for a in articles[:60])
+        prompt = f"""Summarise these Indian market headlines for a retail investor who holds: {', '.join(holdings)}.
+Use ONLY the headlines. No advice, no predictions.
+
+{heads}
+
+Write:
+- **Market mood:** one sentence.
+- **Big themes:** 2–3 bullets.
+- **About my holdings:** 1–3 bullets naming the specific stocks mentioned and what the news says. If nothing material, say so in one line.
+- **Worth a closer look:** at most 2 negative items about holdings, one line each.
+Markdown, under 160 words."""
+        return self.generate(prompt, api_key, max_tokens=450)
+
     def _create_industry_prompt(self, stocks_data: Dict[str, str]) -> str:
         return f"""Analyze the following company descriptions. For each company, provide its primary industry.
 Respond with ONLY a valid JSON object where the keys are the company symbols and the values are the identified industry.
@@ -883,6 +1031,8 @@ class DataSourceManager:
         self.chartink = ChartinkProvider(config)
         self.news     = NewsProvider(config)
         self.ai       = AIProvider(config)
+        from market_data import MarketProvider     # local import: market_data imports nothing from here
+        self.market   = MarketProvider(config)
 
     # --- Thread-safe raw fetchers -------------------------------------------
     # These call the cached scrapers directly and make NO Streamlit calls, so
